@@ -1,156 +1,153 @@
-# Kueue
+# Kueue — chain-adjacency fork
 
-[![Latest Release](https://img.shields.io/github/v/release/kubernetes-sigs/kueue?include_prereleases)](https://github.com/kubernetes-sigs/kueue/releases/latest)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/kubernetes-sigs/kueue)
+[![Upstream](https://img.shields.io/badge/upstream-kubernetes--sigs%2Fkueue-blue)](https://github.com/kubernetes-sigs/kueue)
 
-<img src="https://github.com/kubernetes-sigs/kueue/blob/main/site/static/images/logo.svg" width="100" alt="kueue logo">
+This is a fork of [`kubernetes-sigs/kueue`](https://github.com/kubernetes-sigs/kueue) that adds **rank-deterministic placement on 1-D ordered topologies** with optional **compaction** (relocating bound workloads to defragment a chain).
 
-Kueue is a set of APIs and controller for [job](https://kueue.sigs.k8s.io/docs/concepts/workload)
-[queueing](https://kueue.sigs.k8s.io/docs/concepts#queueing). It is a job-level manager that decides when
-a job should be [admitted](https://kueue.sigs.k8s.io/docs/concepts#admission) to start (as in pods can be
-created) and when it should stop (as in active pods should be deleted).
+It exists to make NCCL ring collectives, NVLink chains, Slingshot dragonfly inter-group traffic, and other adjacency-sensitive fabrics run at full bandwidth on Kubernetes — the existing Kueue [TAS API (KEP-2724)](https://github.com/kubernetes-sigs/kueue/blob/main/keps/2724-topology-aware-scheduling/README.md) handles set-based placement well but doesn't pin rank N to physical position N or defragment. This fork does both.
 
-Read the [overview](https://kueue.sigs.k8s.io/docs/overview/) and watch the Kueue-related [talks & presentations](https://kueue.sigs.k8s.io/docs/talks_and_presentations/) to learn more.
+Everything else is upstream Kueue.
 
-## Features overview
+---
 
-- **Job management:** Support job queueing based on [priorities](https://kueue.sigs.k8s.io/docs/concepts/workload/#priority) with different [strategies](https://kueue.sigs.k8s.io/docs/concepts/cluster_queue/#queueing-strategy): `StrictFIFO` and `BestEffortFIFO`.
-- **Advanced Resource management:** Comprising: [resource flavor fungibility](https://kueue.sigs.k8s.io/docs/concepts/cluster_queue/#flavorfungibility), [Fair Sharing](https://kueue.sigs.k8s.io/docs/concepts/preemption/#fair-sharing), [cohorts](https://kueue.sigs.k8s.io/docs/concepts/cluster_queue/#cohort) and [preemption](https://kueue.sigs.k8s.io/docs/concepts/cluster_queue/#preemption) with a variety of policies between different tenants.
-- **Integrations:** Built-in support for popular jobs, e.g. [BatchJob](https://kueue.sigs.k8s.io/docs/tasks/run/jobs/), [Kubeflow training jobs](https://kueue.sigs.k8s.io/docs/tasks/run/kubeflow/), [RayJob](https://kueue.sigs.k8s.io/docs/tasks/run/rayjobs/), [RayCluster](https://kueue.sigs.k8s.io/docs/tasks/run/rayclusters/), [JobSet](https://kueue.sigs.k8s.io/docs/tasks/run/jobsets/),  [plain Pod and Pod Groups](https://kueue.sigs.k8s.io/docs/tasks/run/plain_pods/).
-- **System insight:** Built-in [prometheus metrics](https://kueue.sigs.k8s.io/docs/reference/metrics/) to help monitor the state of the system, and on-demand visibility endpoint for [monitoring of pending workloads](https://kueue.sigs.k8s.io/docs/tasks/manage/monitor_pending_workloads/pending_workloads_on_demand/).
-- **AdmissionChecks:** A mechanism for internal or external components to influence whether a workload can be [admitted](https://kueue.sigs.k8s.io/docs/concepts/admission_check/).
-- **Advanced autoscaling support:** Integration with cluster-autoscaler's [provisioningRequest](https://kueue.sigs.k8s.io/docs/concepts/admission_check/provisioning_request/#job-using-a-provisioningrequest) via admissionChecks.
-- **All-or-nothing with ready Pods:** A timeout-based implementation of [All-or-nothing scheduling](https://kueue.sigs.k8s.io/docs/tasks/manage/setup_wait_for_pods_ready/).
-- **Partial admission and dynamic reclaim:** mechanisms to run a job with [reduced parallelism](https://kueue.sigs.k8s.io/docs/tasks/run/jobs/#partial-admission), based on available quota, and to [release](https://kueue.sigs.k8s.io/docs/concepts/workload/#dynamic-reclaim) the quota the pods complete..
-- **Mixing training and inference**: Simultaneous management of batch workloads along with serving workloads (such as [Deployments](https://kueue.sigs.k8s.io/docs/tasks/run/deployment/) or [StatefulSets](https://kueue.sigs.k8s.io/docs/tasks/run/statefulset/))
-- **Multi-cluster job dispatching:** called [MultiKueue](https://kueue.sigs.k8s.io/docs/concepts/multikueue/), allows to search for capacity and off-load the main cluster.
-- **Topology-Aware Scheduling**: Allows to optimize the Pod-to-Pod communication throughput by [scheduling aware of the data-center topology](https://kueue.sigs.k8s.io/docs/concepts/topology_aware_scheduling/).
+## What's different
 
-## Production Readiness status
+### 1. `Topology.spec.levels[].ordered` (new field)
 
-- ✔️ API version: v1beta2, respecting [Kubernetes Deprecation Policy](https://kubernetes.io/docs/reference/using-api/deprecation-policy/).
-- ✔️ Up-to-date [documentation](https://kueue.sigs.k8s.io/docs).
-- ✔️ Test coverage:
-  - ✔️ Unit test [testgrid](https://testgrid.k8s.io/sig-scheduling#periodic-kueue-test-unit-main).
-  - ✔️ Integration tests:
-    - ✔️ Baseline suite [testgrid](https://testgrid.k8s.io/sig-scheduling#periodic-kueue-test-integration-baseline-main).
-    - ✔️ Extended suite [testgrid](https://testgrid.k8s.io/sig-scheduling#periodic-kueue-test-integration-extended-main).
-    - ✔️ MultiKueue suite [testgrid](https://testgrid.k8s.io/sig-scheduling#periodic-kueue-test-integration-multikueue-main).
-  - ✔️ E2E tests:
-    - ✔️ Baseline suites for Kubernetes
-      [1.33](https://testgrid.k8s.io/sig-scheduling#periodic-kueue-test-e2e-baseline-main-1-33),
-      [1.34](https://testgrid.k8s.io/sig-scheduling#periodic-kueue-test-e2e-baseline-main-1-34),
-      [1.35](https://testgrid.k8s.io/sig-scheduling#periodic-kueue-test-e2e-baseline-main-1-35)
-      on Kind.
-    - ✔️ Extended suites for Kubernetes
-      [1.33](https://testgrid.k8s.io/sig-scheduling#periodic-kueue-test-e2e-extended-main-1-33),
-      [1.34](https://testgrid.k8s.io/sig-scheduling#periodic-kueue-test-e2e-extended-main-1-34),
-      [1.35](https://testgrid.k8s.io/sig-scheduling#periodic-kueue-test-e2e-extended-main-1-35)
-      on Kind.
-    - ✔️ TAS: 
-      - ✔️ Baseline suite [testgrid](https://testgrid.k8s.io/sig-scheduling#periodic-kueue-test-e2e-tas-baseline-main).
-      - ✔️ Extended suite [testgrid](https://testgrid.k8s.io/sig-scheduling#periodic-kueue-test-e2e-tas-extended-main).
-    - ✔️ Sequential tests: 
-      - ✔️ Baseline suites [testgrid](https://testgrid.k8s.io/sig-scheduling#periodic-kueue-test-e2e-sequential-baseline-main).
-      - ✔️ Extended suites [testgrid](https://testgrid.k8s.io/sig-scheduling#periodic-kueue-test-e2e-sequential-extended-main).
-    - ✔️ E2E Cert Manager test [testgrid](https://testgrid.k8s.io/sig-scheduling#periodic-kueue-test-e2e-certmanager-main).
-    - ✔️ DRA test [testgrid](https://testgrid.k8s.io/sig-scheduling#periodic-kueue-test-e2e-dra-main).
-    - ✔️ MultiKueue:
-      - ✔️ Baseline suite [testgrid](https://testgrid.k8s.io/sig-scheduling#periodic-kueue-test-e2e-multikueue-baseline-main).
-      - ✔️ Extended suites:
-        - ✔️ [shard-0](https://testgrid.k8s.io/sig-scheduling#periodic-kueue-test-e2e-multikueue-extended-shard-0-main)
-        - ✔️ [shard-1](https://testgrid.k8s.io/sig-scheduling#periodic-kueue-test-e2e-multikueue-extended-shard-1-main)
-    - ✔️ MultiKueue DRA test [testgrid](https://testgrid.k8s.io/sig-scheduling#periodic-kueue-test-e2e-multikueue-dra-main).
-  - ✔️ Scheduling performance tests:
-    - ✔️ Baseline suite [testgrid](https://testgrid.k8s.io/sig-scheduling#periodic-kueue-test-scheduling-perf-main).
-    - ✔️ TAS suite [testgrid](https://testgrid.k8s.io/sig-scheduling#periodic-kueue-test-tas-scheduling-perf-main).
-    - ✔️ Large-Scale suite [testgrid](https://testgrid.k8s.io/sig-scheduling#periodic-kueue-test-large-scale-scheduling-perf-main).
-- ✔️ Scalability verification via [performance tests](https://github.com/kubernetes-sigs/kueue/tree/main/test/performance).
-- ✔️ Monitoring via [metrics](https://kueue.sigs.k8s.io/docs/reference/metrics).
-- ✔️ Security: RBAC based accessibility.
-- ✔️ Stable [release](RELEASE.md) cycle (2-3 months).
-- ✔️ [Adopters](https://kueue.sigs.k8s.io/docs/adopters/) running on production.
+Mark one level on a `Topology` as `ordered: true`. Domain values at that level must parse as non-negative integers; the integer order is taken to reflect physical adjacency.
 
-  _Based on community feedback, we continue to simplify and evolve the API to
-  address new use cases_.
-
-## Installation
-
-**Requires Kubernetes 1.29 or newer**.
-
-To install the latest release of Kueue in your cluster, run the following command:
-
-```shell
-kubectl apply --server-side -f https://github.com/kubernetes-sigs/kueue/releases/download/v0.18.3/manifests.yaml
+```yaml
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: Topology
+metadata: {name: chain}
+spec:
+  levels:
+  - nodeLabel: topology.example.com/chain-name
+  - nodeLabel: topology.example.com/chain-index
+    ordered: true
+  - nodeLabel: kubernetes.io/hostname
 ```
 
-The controller runs in the `kueue-system` namespace.
+When a workload requests `kueue.x-k8s.io/podset-slice-required-topology` at an ordered level, the scheduler:
+- Allocates a **leftmost contiguous run** of indices (no fragmentation, no scattered placement).
+- Maps **rank N → start+N** deterministically (the existing rank-aware ungater consumes the assignment in order; this fork makes the assignment honour the integer sort, not lex).
 
-Read the [installation guide](https://kueue.sigs.k8s.io/docs/installation/) to learn more.
+If no contiguous run of the required size exists, the workload stays Pending unless compaction is enabled (below).
 
-## Usage
+### 2. `ClusterQueue.spec.preemption.maxEvictionsPerSchedulingPass` (new field)
 
-A minimal configuration can be set by running the [examples](site/static/examples):
+The compaction budget — the number of bound workloads the scheduler may evict per scheduling pass to defragment an ordered chain and admit a pending workload.
 
-```shell
-kubectl apply -f examples/admin/single-clusterqueue-setup.yaml
+```yaml
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata: {name: chain}
+spec:
+  preemption:
+    maxEvictionsPerSchedulingPass: 1   # nil/0 = never compact
+  ...
 ```
 
-Then you can run a job with:
+Semantics:
+- `nil` or `0` (default): never compact. First-fit only.
+- `N > 0`: compact up to N bound workloads per pass.
 
-```shell
-kubectl create -f examples/jobs/sample-job.yaml
+The allocator is a 1-D arena allocator framed as a compacting GC. It picks the lowest-cost feasible plan, ranking victim sets by:
+
+1. Fewest evictions.
+2. Lex-max victim ordering (minimise the worst victim's priority — matches `pkg/scheduler/preemption/common/ordering.go:CandidatesOrdering`).
+3. Smallest total relocation distance.
+4. Leftmost placement (deterministic tiebreak).
+
+Compaction never displaces a higher-priority workload to admit a lower-priority one. Older workloads are protected against newer at equal priority. Non-evictable bounds (`ordered: false` on the Topology level, or no `tas-ordered-evictable` annotation on the workload) act as pinned obstacles.
+
+### 3. Workload-level evictability opt-in
+
+```yaml
+metadata:
+  annotations:
+    kueue.x-k8s.io/tas-ordered-evictable: "true"
 ```
 
-Learn more about:
+Default is `false` (workloads are not relocated). Job/JobSet/LWS integrations that want different per-kind defaults can set this in their parent webhooks.
 
-- Kueue [concepts](https://kueue.sigs.k8s.io/docs/concepts).
-- Common and advanced [tasks](https://kueue.sigs.k8s.io/docs/tasks).
+---
 
-## Roadmap
+## Quick start
 
-High-level overview of the main priorities for 2026:
-- Improve user experience for [MultiKueue](https://kueue.sigs.k8s.io/docs/concepts/multikueue/) - multi-cluster Job dispatching, in particular:
-  * Support Elastic RayJob [#8712](https://github.com/kubernetes-sigs/kueue/issues/8712)
-  * Workload-Level Admission Constraints and Preference-Aware MultiKueue Dispatching [#8729](https://github.com/kubernetes-sigs/kueue/issues/8729)
-  * Prevent starting preemptions in multiple worker clusters [#8303](https://github.com/kubernetes-sigs/kueue/issues/8303)
-  * Support long running services [#8526](https://github.com/kubernetes-sigs/kueue/issues/8526)
-  * Log retrieval from worker clusters [#3526](https://github.com/kubernetes-sigs/kueue/issues/3526)
-- Improve user experience for [Topology Aware Scheduling](https://kueue.sigs.k8s.io/docs/concepts/topology_aware_scheduling/), in particular:
-  * Support for ResourceTransformations [#8860](https://github.com/kubernetes-sigs/kueue/issues/8860)
-  * Support for [Elastic Workloads](https://kueue.sigs.k8s.io/docs/concepts/elastic_workload/) [#8160](https://github.com/kubernetes-sigs/kueue/issues/8160)
-  * Evict workloads which are running on nodes which become tainted [#8838](https://github.com/kubernetes-sigs/kueue/issues/8828)
-- Integration with the k8s native Workload-Aware Scheduler (WAS) and Topology-Aware Scheduling [#8871](https://github.com/kubernetes-sigs/kueue/issues/8871)
-- Support for Concurrent Workload Admission [#8691](https://github.com/kubernetes-sigs/kueue/issues/8691)
-- Support for running hero workloads [#8826](https://github.com/kubernetes-sigs/kueue/issues/8826)
-- Consider preemption cost when finding preemption candidates [#7990](https://github.com/kubernetes-sigs/kueue/issues/7990)
-- Progress towards Beta for the integration with Dynamic Resource Allocation (DRA)  [#8243](https://github.com/kubernetes-sigs/kueue/issues/8243)
+```bash
+# Install the fork on an existing cluster (replaces upstream Kueue).
+kubectl apply -k 'github.com/AppMana/forks-kueue-chain-adjacency/config/default?ref=chain-adjacency'
 
-Long-term aspirational goals:
-- Partial preemption of serving workloads [#3762](https://github.com/kubernetes-sigs/kueue/issues/3762)
-- Integration with workflow frameworks [#74](https://github.com/kubernetes-sigs/kueue/issues/74)
-- Budget support [#28](https://github.com/kubernetes-sigs/kueue/issues/28)
-- Flavor assignment strategies, e.g. _minimizing cost_ vs _minimizing borrowing_ [#312](https://github.com/kubernetes-sigs/kueue/issues/312)
-- Cooperative preemption support for workloads that implement checkpointing [#477](https://github.com/kubernetes-sigs/kueue/issues/477)
-- Delayed preemption for two-stage admission [#3758](https://github.com/kubernetes-sigs/kueue/issues/3758)
-- Support Structured Parameters (DRA) in Kueue [#2941](https://github.com/kubernetes-sigs/kueue/issues/2941)
-- Graduate the API to v1 [#3476](https://github.com/kubernetes-sigs/kueue/issues/3476)
+# Or build a local image and load into kind:
+make image-build IMAGE_REGISTRY=harbor.appmana.com/appmana-shared PLATFORMS=linux/amd64
+kind load docker-image harbor.appmana.com/appmana-shared/kueue:main
+```
 
-## Community, discussion, contribution, and support
+Define a Topology with one ordered level (see above), a ResourceFlavor pointing at it, a ClusterQueue with the budget set, and apply your workloads with the standard Kueue TAS annotations:
 
-Learn how to engage with the Kubernetes community on the [community page](http://kubernetes.io/community/)
-and the [contributor's guide](CONTRIBUTING.md).
+```yaml
+metadata:
+  labels:
+    kueue.x-k8s.io/queue-name: chain
+  annotations:
+    kueue.x-k8s.io/podset-required-topology: topology.example.com/chain-name
+    kueue.x-k8s.io/podset-slice-required-topology: topology.example.com/chain-index
+    kueue.x-k8s.io/podset-slice-size: "1"
+    kueue.x-k8s.io/tas-ordered-evictable: "true"   # opt in to compaction
+```
 
-You can reach the maintainers of this project at:
+---
 
-- [Slack](https://kubernetes.slack.com/messages/wg-batch)
-- [Mailing List](https://groups.google.com/a/kubernetes.io/g/wg-batch)
+## How it works
 
-### Graphic assets
+| Layer | What | Where |
+|---|---|---|
+| API | `Ordered` on `TopologyLevel`, `MaxEvictionsPerSchedulingPass` on `ClusterQueuePreemption` | `apis/kueue/v1beta2/{topology,clusterqueue}_types.go` |
+| Snapshot | `levelOrdered` on `TASFlavorSnapshot`; numeric sort at ordered levels; per-workload `boundOrderedAllocations` populated from the cache | `pkg/cache/scheduler/tas_flavor_snapshot.go`, `tas_flavor.go`, `tas_cache.go` |
+| Allocator | Pure-Go compacting-GC 1-D allocator; pluggable `victimComparator` for plan-level cost (defaults to lex-max-priority + age) | `pkg/cache/scheduler/tas_ordered.go` |
+| Dispatch | At ordered child levels, contiguous-run pick replaces the upstream capacity-first set pick; falls through to `findCompactionPlan` when budget > 0 | `pkg/cache/scheduler/tas_flavor_snapshot.go: findTopologyAssignment` |
+| Result | `tasPodSetAssignmentResult.CompactionEvictions []workload.Reference` carries the eviction list | `pkg/cache/scheduler/tas_flavor_snapshot.go` |
+| Scheduler | `Assignment.TASCompactionEvictions` is drained via `scheduler.issueTASCompaction` (same shape as `issueMigration`); pending workload requeues | `pkg/scheduler/{flavorassigner,scheduler}.go` |
 
-- [Kueue](https://github.com/cncf/artwork/tree/main/projects/kubernetes/sub-projects/kueue)
-- [KueueViz](https://github.com/cncf/artwork/tree/main/projects/kubernetes/sub-projects/kueueviz)
+`ordered: false` is the default, so existing TAS workloads — and the entire upstream Kueue test suite — are bit-for-bit unaffected.
 
-### Code of conduct
+---
 
-Participation in the Kubernetes community is governed by the [Kubernetes Code of Conduct](code-of-conduct.md).
+## Tests
+
+```bash
+go test -race ./pkg/cache/scheduler/ ./pkg/scheduler/...
+```
+
+Notable coverage in this fork:
+
+- `pkg/cache/scheduler/tas_ordered_test.go` — 36+ pure-Go allocator scenarios. Memory-allocator-style fragmentation patterns (checkerboard, worst-case), budget knob spectrum (0 → ∞), priority and age tiebreakers, pluggable comparator, LWS-vs-JobSet evictability semantics on a 12-node chain.
+- `pkg/cache/scheduler/tas_ordered_snapshot_test.go` — numeric ordering at ordered levels; `Ordered=false` regression guard verifying upstream lex behaviour is preserved.
+- `pkg/cache/scheduler/tas_ordered_dispatch_test.go` — end-to-end through `FindTopologyAssignmentsForFlavor`, including the 5-case compaction matrix (budget=0 disabled, budget=1 with newer-victim tiebreak, non-evictable bounds, priority-blocked, request priority overriding).
+
+---
+
+## Status
+
+Beta-quality. Algorithm and snapshot integration are well-tested; the scheduler-level `issueTASCompaction` path uses the existing `workload.Evict` machinery (same channel as `issueMigration`) and requeues the pending workload for the next cycle.
+
+Future work — likely upstream-able as KEP-2724 Story 4 ("rank-aware packing of pods"):
+
+- Per-kind evictability defaults wired through the LWS / JobSet / Job integrations (so workloads don't need the annotation).
+- Multi-ordered-level topologies (today only one ordered level per Topology is allowed).
+- A `victimComparator` that delegates to `CandidatesOrdering` so compaction stays bit-consistent with cohort-wide preemption decisions.
+
+---
+
+## Upstream
+
+Kept in sync with `kubernetes-sigs/kueue`. The `chain-adjacency` branch holds the patch; `main` tracks upstream.
+
+```bash
+git remote add upstream https://github.com/kubernetes-sigs/kueue.git
+git fetch upstream
+git rebase upstream/main chain-adjacency   # rebase the patch
+```
+
+For everything not specific to chain-adjacency (job integrations, fair sharing, MultiKueue, AdmissionChecks, etc.), see the [upstream Kueue documentation](https://kueue.sigs.k8s.io/).

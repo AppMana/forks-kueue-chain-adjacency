@@ -18,6 +18,7 @@ package scheduler
 
 import (
 	"slices"
+	"strconv"
 	"sync"
 
 	"github.com/go-logr/logr"
@@ -65,6 +66,22 @@ type topologyInformation struct {
 	// levels is a list of levels defined in the Topology object referenced
 	// by the flavor corresponding to the cache.
 	Levels []string
+	// Ordered parallels Levels: Ordered[i] indicates whether the i-th level
+	// has a meaningful 1-D integer order derived from the level's node-label
+	// value. Ordered levels require contiguous-run allocations (rank N goes
+	// to start+N at the level).
+	Ordered []bool
+}
+
+// wlBoundMeta captures the per-workload bookkeeping that ordered-level
+// compaction needs: priority, admission time, and evictability. These are
+// derived from the Workload object at addUsage time and stored alongside
+// wlUsage so the snapshot can construct boundOrderedAllocation entries
+// without re-reading the Workload during scheduling.
+type wlBoundMeta struct {
+	priority  int32
+	boundAt   int64
+	evictable bool
 }
 
 type TASFlavorCache struct {
@@ -87,6 +104,12 @@ type TASFlavorCache struct {
 	// usage removal indempotent - skip if it was not added.
 	wlUsage map[workload.Reference][]workload.TopologyDomainRequests
 
+	// wlMeta stores the per-workload metadata used by ordered-level
+	// compaction: priority, admission time, evictability. Populated in
+	// parallel with wlUsage; default zero values yield "non-evictable,
+	// priority 0, admitted now" which is safe for non-ordered topologies.
+	wlMeta map[workload.Reference]wlBoundMeta
+
 	// nonTasUsageCache maintains the usage coming from non-TAS pods,
 	// e.g. static Pods or DaemonSet pods.
 	nonTasUsageCache *nonTasUsageCache
@@ -100,6 +123,7 @@ func (t *tasCache) NewTASFlavorCache(topologyInfo topologyInformation,
 		flavor:           flavorInfo,
 		usage:            make(map[utiltas.TopologyDomainID]resources.Requests),
 		wlUsage:          make(map[workload.Reference][]workload.TopologyDomainRequests),
+		wlMeta:           make(map[workload.Reference]wlBoundMeta),
 		nonTasUsageCache: t.nonTasUsageCache,
 	}
 }
@@ -133,6 +157,7 @@ func (c *TASFlavorCache) snapshot(
 	log.V(3).Info("Constructing TAS snapshot", infoKV...)
 
 	snapshot := newTASFlavorSnapshot(log, c.flavor.TopologyName, c.topology.Levels, c.flavor.Tolerations)
+	snapshot.setLevelOrdered(c.topology.Ordered)
 	nodeToDomain := make(map[string]utiltas.TopologyDomainID)
 	for _, node := range nodes {
 		nodeToDomain[node.Name] = snapshot.addNode(node)
@@ -151,15 +176,85 @@ func (c *TASFlavorCache) snapshot(
 			snapshot.addNonTASUsage(domainID, usage)
 		}
 	})
+	// Build boundOrderedAllocations only when the topology has an ordered
+	// level, since it's the sole consumer. For each bound workload, derive
+	// (start, size) from its per-domain placement.
+	if snapshot.hasOrderedLevels() {
+		snapshot.setBoundOrderedAllocations(c.buildBoundOrderedAllocations(snapshot))
+	}
 	return snapshot
 }
 
+// buildBoundOrderedAllocations turns the cache's wlUsage + wlMeta into the
+// ordered-allocation shape the snapshot's compaction path consumes. A
+// workload's chain-index range is derived from the integer values its
+// per-domain placement carries at the ordered level. Workloads whose
+// placement isn't on the ordered level (e.g. they're admitted on a
+// different flavor or before the snapshot's nodes existed) are dropped.
+func (c *TASFlavorCache) buildBoundOrderedAllocations(s *TASFlavorSnapshot) []boundOrderedAllocation {
+	orderedIdx := s.firstOrderedLevelIdx()
+	if orderedIdx < 0 {
+		return nil
+	}
+	if orderedIdx >= len(c.topology.Levels) {
+		return nil
+	}
+	out := make([]boundOrderedAllocation, 0, len(c.wlUsage))
+	for ref, requests := range c.wlUsage {
+		var indices []int
+		for _, req := range requests {
+			// req.Values may be at the lowest level only when
+			// isLowestLevelNode is true; resolve via leaf lookup so the
+			// chain-index value is recoverable in either encoding.
+			leaf, ok := s.leaves[utiltas.DomainID(req.Values)]
+			if !ok || orderedIdx >= len(leaf.levelValues) {
+				continue
+			}
+			n, err := strconv.Atoi(leaf.levelValues[orderedIdx])
+			if err != nil {
+				continue
+			}
+			indices = append(indices, n)
+		}
+		if len(indices) == 0 {
+			continue
+		}
+		slices.Sort(indices)
+		start := indices[0]
+		size := indices[len(indices)-1] - start + 1
+		meta := c.wlMeta[ref]
+		out = append(out, boundOrderedAllocation{
+			ref:       ref,
+			start:     start,
+			size:      size,
+			priority:  meta.priority,
+			boundAt:   meta.boundAt,
+			evictable: meta.evictable,
+		})
+	}
+	return out
+}
+
 func (c *TASFlavorCache) addUsage(log logr.Logger, key workload.Reference, topologyRequests []workload.TopologyDomainRequests) {
+	c.addUsageWithMeta(log, key, topologyRequests, wlBoundMeta{})
+}
+
+// addUsageWithMeta records bound usage along with the per-workload metadata
+// that ordered-level compaction reads. Use this from production paths that
+// have access to the Workload (priority, admission time, evictability);
+// addUsage is a thin shim retained for callers that don't.
+func (c *TASFlavorCache) addUsageWithMeta(
+	log logr.Logger,
+	key workload.Reference,
+	topologyRequests []workload.TopologyDomainRequests,
+	meta wlBoundMeta,
+) {
 	if _, found := c.wlUsage[key]; found {
 		log.V(2).Info("Workload usage already exists in TAS flavor cache, self-healing by replacing it", "workload", key)
 		c.removeUsage(log, key)
 	}
 	c.wlUsage[key] = slices.Clone(topologyRequests)
+	c.wlMeta[key] = meta
 	c.updateUsage(topologyRequests, add)
 }
 
@@ -171,6 +266,7 @@ func (c *TASFlavorCache) removeUsage(log logr.Logger, key workload.Reference) {
 	}
 	c.updateUsage(value, subtract)
 	delete(c.wlUsage, key)
+	delete(c.wlMeta, key)
 }
 
 func (c *TASFlavorCache) updateUsage(topologyRequests []workload.TopologyDomainRequests, op usageOp) {

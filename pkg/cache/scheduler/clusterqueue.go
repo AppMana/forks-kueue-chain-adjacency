@@ -597,17 +597,46 @@ func (c *clusterQueue) updateWorkloadTASUsage(log logr.Logger, wi *workload.Info
 	}
 	key := workload.Key(wi.Obj)
 	log = log.WithValues("workload", key)
+	meta := boundMetaFromWorkload(wi)
 	for tasFlavor, tasUsage := range wi.TASUsage() {
 		tasFlvCache := c.tasCache.Get(tasFlavor)
 		switch {
 		case tasFlvCache == nil:
 			log.V(2).Info("TAS flavor used by workload not found in cache", "tasFlavor", tasFlavor)
 		case op == add:
-			tasFlvCache.addUsage(log, key, tasUsage)
+			tasFlvCache.addUsageWithMeta(log, key, tasUsage, meta)
 		case op == subtract:
 			tasFlvCache.removeUsage(log, key)
 		}
 	}
+}
+
+// boundMetaFromWorkload extracts the per-workload metadata that ordered
+// compaction needs: priority (Workload.Spec.Priority, defaulted to 0),
+// admission timestamp (QuotaReserved condition's last transition, falling
+// back to 0), and evictability (the
+// kueue.x-k8s.io/tas-ordered-evictable annotation, default false).
+//
+// The annotation is intentionally opt-in for the first pass: a Kueue
+// install picking up this fork doesn't automatically enable compaction
+// for any workload. The job-integration controllers (LWS, JobSet, plain
+// Job) can later default the annotation per kind, mirroring the plan's
+// "LWS evictable, JobSet/Job not evictable" intent.
+func boundMetaFromWorkload(wi *workload.Info) wlBoundMeta {
+	out := wlBoundMeta{}
+	if wi == nil || wi.Obj == nil {
+		return out
+	}
+	if wi.Obj.Spec.Priority != nil {
+		out.priority = *wi.Obj.Spec.Priority
+	}
+	if cond := apimeta.FindStatusCondition(wi.Obj.Status.Conditions, kueue.WorkloadQuotaReserved); cond != nil {
+		out.boundAt = cond.LastTransitionTime.UnixNano()
+	}
+	if v := wi.Obj.Annotations["kueue.x-k8s.io/tas-ordered-evictable"]; v == "true" {
+		out.evictable = true
+	}
+	return out
 }
 
 func updateFlavorUsage(newUsage resources.FlavorResourceQuantities, oldUsage resources.FlavorResourceQuantities, op usageOp) {

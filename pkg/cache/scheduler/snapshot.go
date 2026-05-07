@@ -93,6 +93,19 @@ func (s *Snapshot) SimulateWorkloadRemoval(workloads []*workload.Info) func() {
 	}
 }
 
+// Workload returns the workload.Info for the given Reference if it is
+// admitted to any ClusterQueue captured in this snapshot, or nil if not
+// found. Used by the scheduler to resolve TAS compaction victims (which
+// are listed by Reference) before issuing eviction.
+func (s *Snapshot) Workload(ref workload.Reference) *workload.Info {
+	for _, cq := range s.ClusterQueues() {
+		if wl, ok := cq.Workloads[ref]; ok {
+			return wl
+		}
+	}
+	return nil
+}
+
 func (s *Snapshot) Log(log logr.Logger) {
 	for name, cq := range s.ClusterQueues() {
 		cohortName := "<none>"

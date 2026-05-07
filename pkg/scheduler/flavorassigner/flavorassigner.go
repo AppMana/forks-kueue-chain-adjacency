@@ -76,15 +76,34 @@ type Assignment struct {
 
 	// quotaCheckStrategy is the strategy to use for quota check.
 	quotaCheckStrategy configapi.QuotaCheckStrategy
+
+	// TASCompactionEvictions lists Workloads that must be evicted to realise
+	// this assignment on an Ordered topology level. Set by UpdateForTASResult
+	// when the snapshot's compaction path produced relocations. The scheduler
+	// drains this list via workload.Evict() before admitting the pending
+	// workload (similar in shape to issueMigration but driven by topology
+	// fragmentation rather than resource flavor migration).
+	TASCompactionEvictions []workload.Reference
 }
 
 // UpdateForTASResult updates the Assignment with the TAS result
 func (a *Assignment) UpdateForTASResult(log logr.Logger, cq *schdcache.ClusterQueueSnapshot, wl *workload.Info, result schdcache.TASAssignmentsResult) {
+	seenEviction := make(map[workload.Reference]struct{})
 	for psName, psResult := range result {
 		psAssignment := a.podSetAssignmentByName(psName)
 		psAssignment.TopologyAssignment = psResult.TopologyAssignment
 		if psResult.TopologyAssignment != nil && psAssignment.DelayedTopologyRequest != nil {
 			psAssignment.DelayedTopologyRequest = ptr.To(kueue.DelayedTopologyRequestStateReady)
+		}
+		// Collect per-podset compaction evictions into the assignment-level
+		// list, deduplicating references in case the same workload is named
+		// by multiple podsets (e.g. LWS leader+worker share the eviction).
+		for _, ref := range psResult.CompactionEvictions {
+			if _, ok := seenEviction[ref]; ok {
+				continue
+			}
+			seenEviction[ref] = struct{}{}
+			a.TASCompactionEvictions = append(a.TASCompactionEvictions, ref)
 		}
 	}
 	a.Usage.TAS = a.ComputeTASNetUsage(log, cq, wl, nil)
@@ -733,7 +752,20 @@ func (a *FlavorAssigner) assignFlavors(log logr.Logger, counts []int32) Assignme
 	if features.Enabled(features.TopologyAwareScheduling) {
 		tasRequests := assignment.WorkloadsTopologyRequests(log, a.wl, a.cq)
 		if assignment.RepresentativeMode() == Fit {
-			result := a.cq.FindTopologyAssignmentsForWorkload(tasRequests, schdcache.WithWorkload(a.wl.Obj))
+			// Compose TAS-call options. The compaction budget is read from
+			// the admitting CQ's Preemption.MaxEvictionsPerSchedulingPass;
+			// nil/zero leaves compaction disabled. The request priority
+			// comes from the workload's Spec.Priority and is used by the
+			// orderedAllocator to enforce "victim priority ≤ request
+			// priority" during compaction.
+			tasOpts := []schdcache.FindTopologyAssignmentsOption{
+				schdcache.WithWorkload(a.wl.Obj),
+				schdcache.WithCompactionBudget(int(ptr.Deref(a.cq.Preemption.MaxEvictionsPerSchedulingPass, 0))),
+			}
+			if a.wl.Obj.Spec.Priority != nil {
+				tasOpts = append(tasOpts, schdcache.WithRequestPriority(*a.wl.Obj.Spec.Priority))
+			}
+			result := a.cq.FindTopologyAssignmentsForWorkload(tasRequests, tasOpts...)
 			if failure := result.Failure(); failure != nil {
 				// There is at least one PodSet which does not fit
 				psAssignment := assignment.podSetAssignmentByName(failure.PodSetName)

@@ -558,6 +558,40 @@ type ClusterQueuePreemption struct {
 	// +kubebuilder:validation:Enum=Never;LowerPriority;LowerOrNewerEqualPriority
 	// +optional
 	WithinClusterQueue PreemptionPolicy `json:"withinClusterQueue,omitempty"`
+
+	// maxEvictionsPerSchedulingPass caps the number of bound Workloads that
+	// the scheduler may relocate during a single scheduling pass to make room
+	// for a pending Workload on an Ordered topology level (compaction).
+	// Compaction is the operation of moving an already-admitted Workload to a
+	// different contiguous range on a 1-D ordered fabric so that a fragmented
+	// free area can be merged into a contiguous run that the pending Workload
+	// can occupy. Examples of ordered fabrics include NVLink and Infinity
+	// Fabric rings, Slingshot dragonfly inter-group links, and any topology
+	// where rank-to-position adjacency drives collective bandwidth.
+	//
+	// Possible values:
+	//   - nil or 0 (default): never compact. The scheduler only places
+	//     pending Workloads on existing contiguous free runs.
+	//   - N > 0: compact up to N Workloads per pass. Higher values admit
+	//     more pending Workloads at the cost of disrupting more running
+	//     Workloads. There is no special "infinity" value; setting N to a
+	//     value at or above the chain capacity is effectively unbounded.
+	//
+	// Compaction is orthogonal to classical priority-based preemption: it
+	// only relocates same-or-lower-priority bound Workloads, never
+	// displacing a higher-priority Workload to admit a lower-priority one.
+	// Among feasible compaction plans, the scheduler picks the one with the
+	// fewest evictions, then the lowest-impact victim set per
+	// CandidatesOrdering.
+	//
+	// This field has effect only when the assigned ResourceFlavor's Topology
+	// declares a level with `ordered: true` and the PodSet's
+	// `podset-slice-required-topology` resolves to that level. On
+	// non-ordered topologies it is ignored.
+	//
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	MaxEvictionsPerSchedulingPass *int32 `json:"maxEvictionsPerSchedulingPass,omitempty"`
 }
 
 type BorrowWithinCohortPolicy string

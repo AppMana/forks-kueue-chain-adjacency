@@ -80,6 +80,19 @@ func Levels(topology *kueue.Topology) []string {
 	return result
 }
 
+// LevelsOrdered returns the per-level Ordered flags from a Topology in the
+// same order as Levels. An ordered level signals that domains at that level
+// have a meaningful 1-D order derived from their node-label value (parsed
+// as a non-negative integer); allocators are expected to honour that order
+// when placing pods (rank N → start+N) and to require contiguous runs.
+func LevelsOrdered(topology *kueue.Topology) []bool {
+	result := make([]bool, len(topology.Spec.Levels))
+	for i, level := range topology.Spec.Levels {
+		result[i] = level.Ordered
+	}
+	return result
+}
+
 func IsNodeStatusConditionTrue(conditions []corev1.NodeCondition, conditionType corev1.NodeConditionType) bool {
 	for _, cond := range conditions {
 		if cond.Type == conditionType {

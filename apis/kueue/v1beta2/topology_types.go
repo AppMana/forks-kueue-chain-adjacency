@@ -115,6 +115,7 @@ type TopologySpec struct {
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="field is immutable"
 	// +kubebuilder:validation:XValidation:rule="size(self.filter(i, size(self.filter(j, j == i)) > 1)) == 0",message="must be unique"
 	// +kubebuilder:validation:XValidation:rule="size(self.filter(i, i.nodeLabel == 'kubernetes.io/hostname')) == 0 || self[size(self) - 1].nodeLabel == 'kubernetes.io/hostname'",message="the kubernetes.io/hostname label can only be used at the lowest level of topology"
+	// +kubebuilder:validation:XValidation:rule="size(self.filter(i, has(i.ordered) && i.ordered)) <= 1",message="at most one level can be ordered"
 	Levels []TopologyLevel `json:"levels,omitempty"`
 }
 
@@ -132,6 +133,30 @@ type TopologyLevel struct {
 	// +kubebuilder:validation:MaxLength=316
 	// +kubebuilder:validation:Pattern=`^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$`
 	NodeLabel string `json:"nodeLabel,omitempty"`
+
+	// ordered, when true, indicates that domains at this level have a
+	// meaningful 1-D order derived from the nodeLabel value. Values of the
+	// nodeLabel must parse as non-negative integers and the integer order
+	// reflects physical adjacency in the underlying topology — for
+	// instance, the index of a node within an NVLink ring, of an AMD
+	// MI300X GCD within an Infinity Fabric XGMI ring, or of a chassis
+	// within a Slingshot dragonfly group, where neighbouring positions
+	// share lower-latency / higher-bandwidth links.
+	//
+	// When ordered is true, allocations at this level are required to form a
+	// contiguous run in integer order, and rank N of a PodSet's pods is
+	// mapped to the (start+N)-th value at this level. This is intended for
+	// 1-D physically-ordered fabrics where adjacency is load-bearing for
+	// performance.
+	//
+	// At most one level per Topology may be ordered (multi-ordered
+	// hierarchies are out of scope).
+	//
+	// Default is false, preserving the unordered set-based placement behaviour.
+	//
+	// +optional
+	// +kubebuilder:default=false
+	Ordered bool `json:"ordered,omitempty"`
 }
 
 // +genclient

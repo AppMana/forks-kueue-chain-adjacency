@@ -30,6 +30,26 @@ type TopologyLevelApplyConfiguration struct {
 	// - cloud.provider.com/topology-block
 	// - cloud.provider.com/topology-rack
 	NodeLabel *string `json:"nodeLabel,omitempty"`
+	// ordered, when true, indicates that domains at this level have a
+	// meaningful 1-D order derived from the nodeLabel value. Values of the
+	// nodeLabel must parse as non-negative integers and the integer order
+	// reflects physical adjacency in the underlying topology — for
+	// instance, the index of a node within an NVLink ring, of an AMD
+	// MI300X GCD within an Infinity Fabric XGMI ring, or of a chassis
+	// within a Slingshot dragonfly group, where neighbouring positions
+	// share lower-latency / higher-bandwidth links.
+	//
+	// When ordered is true, allocations at this level are required to form a
+	// contiguous run in integer order, and rank N of a PodSet's pods is
+	// mapped to the (start+N)-th value at this level. This is intended for
+	// 1-D physically-ordered fabrics where adjacency is load-bearing for
+	// performance.
+	//
+	// At most one level per Topology may be ordered (multi-ordered
+	// hierarchies are out of scope).
+	//
+	// Default is false, preserving the unordered set-based placement behaviour.
+	Ordered *bool `json:"ordered,omitempty"`
 }
 
 // TopologyLevelApplyConfiguration constructs a declarative configuration of the TopologyLevel type for use with
@@ -43,5 +63,13 @@ func TopologyLevel() *TopologyLevelApplyConfiguration {
 // If called multiple times, the NodeLabel field is set to the value of the last call.
 func (b *TopologyLevelApplyConfiguration) WithNodeLabel(value string) *TopologyLevelApplyConfiguration {
 	b.NodeLabel = &value
+	return b
+}
+
+// WithOrdered sets the Ordered field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the Ordered field is set to the value of the last call.
+func (b *TopologyLevelApplyConfiguration) WithOrdered(value bool) *TopologyLevelApplyConfiguration {
+	b.Ordered = &value
 	return b
 }

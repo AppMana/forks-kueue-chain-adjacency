@@ -469,9 +469,64 @@ func (s *Scheduler) processEntry(
 		}
 	}
 
+	if len(e.assignment.TASCompactionEvictions) > 0 {
+		s.issueTASCompaction(ctx, log, e, snapshot)
+		return
+	}
+
 	e.markNominated()
 	if err := s.admit(ctx, e, cq, oldWorkloadSlice); err != nil {
 		e.inadmissibleMsg = fmt.Sprintf("Failed to admit workload: %v", err)
+	}
+}
+
+// issueTASCompaction evicts the bound Workloads named by the assignment's
+// TASCompactionEvictions list so the chain layout can defragment, then
+// requeues the pending workload for the next scheduling cycle. It mirrors
+// issueMigration in shape: a same-priority eviction with the workload
+// going back to the queue, not a priority-based preemption.
+//
+// This is the operational arm of the compacting-GC primitive at the
+// snapshot level — the snapshot computed which workloads to relocate;
+// this function actually issues the evictions.
+func (s *Scheduler) issueTASCompaction(ctx context.Context, log logr.Logger, e *entry, snapshot *schdcache.Snapshot) {
+	evicted := 0
+	failed := 0
+	for _, ref := range e.assignment.TASCompactionEvictions {
+		victim := snapshot.Workload(ref)
+		if victim == nil {
+			log.V(2).Info("TAS compaction victim not found in snapshot; skipping",
+				"victim", ref)
+			continue
+		}
+		wlCopy := victim.Obj.DeepCopy()
+		exposeLqMetrics := s.cache.ShouldExposeLocalQueueMetricsForWorkload(log, wlCopy)
+		message := fmt.Sprintf(
+			"Evicted to admit workload (UID: %s) requiring chain compaction on an Ordered topology level",
+			e.Obj.UID)
+		log.V(3).Info("Issuing TAS compaction eviction",
+			"victim", klog.KObj(wlCopy), "evictor", klog.KObj(e.Obj))
+		err := workload.Evict(
+			ctx, s.client, s.recorder, wlCopy,
+			kueue.WorkloadEvictedByFlavorMigration, message, "",
+			s.clock, exposeLqMetrics, s.roleTracker, s.customLabels,
+			workload.EvictWithLooseOnApply(), workload.EvictWithRetryOnConflictForPatch(),
+		)
+		if err != nil {
+			failed++
+			log.Error(err, "Failed to evict TAS compaction victim", "victim", klog.KObj(wlCopy))
+			continue
+		}
+		evicted++
+	}
+	e.LastAssignment = nil
+	switch {
+	case failed > 0:
+		e.requeueReason = qcache.RequeueReasonPreemptionFailed
+		e.inadmissibleMsg += fmt.Sprintf(". TAS compaction failed for %d workload(s)", failed)
+	default:
+		e.requeueReason = qcache.RequeueReasonPendingMigration
+		e.inadmissibleMsg += fmt.Sprintf(". Pending TAS compaction of %d workload(s)", evicted)
 	}
 }
 

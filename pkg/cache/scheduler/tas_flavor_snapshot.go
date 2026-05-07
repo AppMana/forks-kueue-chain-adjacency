@@ -121,6 +121,13 @@ type TASFlavorSnapshot struct {
 	// on the Topology object
 	levelKeys []string
 
+	// levelOrdered parallels levelKeys: levelOrdered[i] is true when the
+	// i-th level has Ordered=true on its Topology spec, signalling that
+	// domain values at that level are integers and that allocations there
+	// must form contiguous runs in integer order. nil or all-false
+	// preserves the upstream set-based placement behaviour.
+	levelOrdered []bool
+
 	// leaves maps domainID to domains that are at the lowest level of topology structure
 	leaves leafDomainByID
 
@@ -138,6 +145,336 @@ type TASFlavorSnapshot struct {
 
 	// isLowestLevelNode indicates if kubernetes.io/hostname is the lowest topology level
 	isLowestLevelNode bool
+
+	// boundOrderedAllocations describes the Workloads currently bound to
+	// this flavor's Ordered topology level, in the shape the orderedAllocator
+	// consumes for compaction. Populated by the cache at snapshot-build time
+	// (or by tests via setBoundOrderedAllocations); empty when there is no
+	// Ordered level on the topology or when no workloads are bound.
+	boundOrderedAllocations []boundOrderedAllocation
+}
+
+// setLevelOrdered installs the per-level Ordered flags on the snapshot.
+// Must be called BEFORE initialize() because the children of ordered-level
+// parents are sorted at initialize-time based on these flags.
+func (s *TASFlavorSnapshot) setLevelOrdered(ordered []bool) {
+	if len(ordered) == 0 {
+		return
+	}
+	if len(ordered) != len(s.levelKeys) {
+		s.log.Error(errCodeAssumptionsViolated,
+			"ordered length mismatches level count",
+			"orderedLen", len(ordered), "levelKeysLen", len(s.levelKeys))
+		return
+	}
+	s.levelOrdered = slices.Clone(ordered)
+}
+
+// isOrderedLevel reports whether the level at the given index is Ordered.
+// Safe to call before setLevelOrdered: returns false in that case.
+func (s *TASFlavorSnapshot) isOrderedLevel(levelIdx int) bool {
+	if levelIdx < 0 || levelIdx >= len(s.levelOrdered) {
+		return false
+	}
+	return s.levelOrdered[levelIdx]
+}
+
+// hasOrderedLevels reports whether at least one level on this topology is
+// Ordered. Used as a fast-path skip when no ordering is configured.
+func (s *TASFlavorSnapshot) hasOrderedLevels() bool {
+	for _, b := range s.levelOrdered {
+		if b {
+			return true
+		}
+	}
+	return false
+}
+
+// orderedLevelValueLess compares two domains' level values at the given
+// level. When the level is Ordered and both values parse as non-negative
+// integers, the comparison is numeric (so "10" sorts after "2"). Otherwise
+// it falls back to string comparison.
+func (s *TASFlavorSnapshot) orderedLevelValueLess(levelIdx int, av, bv string) int {
+	if s.isOrderedLevel(levelIdx) {
+		if ai, err := strconv.Atoi(av); err == nil {
+			if bi, err := strconv.Atoi(bv); err == nil {
+				return cmp.Compare(ai, bi)
+			}
+		}
+	}
+	return cmp.Compare(av, bv)
+}
+
+// compareDomainLevelValues replaces slices.Compare(a.levelValues,
+// b.levelValues) with an ordering that respects Ordered levels: at each
+// level position, numeric comparison if Ordered, lex otherwise.
+func (s *TASFlavorSnapshot) compareDomainLevelValues(a, b []string) int {
+	n := min(len(a), len(b))
+	for i := 0; i < n; i++ {
+		if c := s.orderedLevelValueLess(i, a[i], b[i]); c != 0 {
+			return c
+		}
+	}
+	return cmp.Compare(len(a), len(b))
+}
+
+// sortDomainsByLevelValues returns a stable clone of `domains` ordered by
+// compareDomainLevelValues. Used at ordered child levels where contiguous
+// picking depends on a deterministic numerical sequence even when domains
+// span multiple parent groups (in which case the per-parent pre-sort done
+// at initialize() time is not enough).
+func (s *TASFlavorSnapshot) sortDomainsByLevelValues(domains []*domain) []*domain {
+	result := slices.Clone(domains)
+	slices.SortFunc(result, func(a, b *domain) int {
+		return s.compareDomainLevelValues(a.levelValues, b.levelValues)
+	})
+	return result
+}
+
+// firstOrderedLevelIdx returns the index of the (single) Ordered level on
+// this snapshot, or -1 if there is none. The Topology API restricts at most
+// one Ordered level per Topology, so the first match is canonical.
+func (s *TASFlavorSnapshot) firstOrderedLevelIdx() int {
+	for i, ord := range s.levelOrdered {
+		if ord {
+			return i
+		}
+	}
+	return -1
+}
+
+// boundOrderedAllocation describes a Workload currently bound to a
+// contiguous run on this snapshot's Ordered level, in the form the
+// orderedAllocator consumes for compaction. It carries enough information
+// to (a) decide which workloads to evict and (b) emit the eviction back to
+// the caller for preemption.
+type boundOrderedAllocation struct {
+	// ref identifies the bound Workload; surfaced in the result so the
+	// scheduler can preempt it.
+	ref workload.Reference
+	// start is the lowest Ordered-level index the workload occupies.
+	start int
+	// size is the number of consecutive Ordered-level indices it occupies.
+	size int
+	// priority is the workload's effective priority (Workload.Spec.Priority,
+	// with a default of 0).
+	priority int32
+	// boundAt is a unix-nano timestamp of admission, used to protect older
+	// workloads from being preferentially evicted.
+	boundAt int64
+	// evictable indicates whether the workload may be relocated by
+	// compaction. Defaults to false; turned on per-kind / per-annotation
+	// by the integration layer.
+	evictable bool
+}
+
+// setBoundOrderedAllocations installs the list of currently-bound workloads
+// for this snapshot. Used by the cache when constructing the snapshot for
+// a flavor, and by tests that want to drive compaction directly.
+func (s *TASFlavorSnapshot) setBoundOrderedAllocations(bs []boundOrderedAllocation) {
+	s.boundOrderedAllocations = slices.Clone(bs)
+}
+
+// findCompactionPlan converts the snapshot's bound workloads into the
+// orderedAllocator's input shape, runs schedule() with the supplied budget,
+// and returns the picked domains in numeric order plus the list of
+// Workload references the caller must evict to realise the plan.
+//
+// Returns (nil, nil, "<reason>") when no plan can be found within the
+// budget, including the "budget = 0, no first-fit" case.
+//
+// The orderedDomains argument is the parent's children at the Ordered
+// level, pre-sorted numerically.
+func (s *TASFlavorSnapshot) findCompactionPlan(
+	orderedDomains []*domain,
+	slicesNeeded int32,
+	leaderCount int32,
+	sliceSize int32,
+	requestPriority int32,
+	budget int,
+) ([]*domain, []workload.Reference, string) {
+	chainSize := len(orderedDomains)
+	if chainSize == 0 {
+		return nil, nil, "no domains at ordered level"
+	}
+	// Build a position lookup: chain-index integer → orderedDomains index.
+	posByIdx := make(map[int]int, chainSize)
+	for i, d := range orderedDomains {
+		// The numeric label value is at position firstOrderedLevelIdx; for
+		// the parent's children that is the *last* level position in
+		// d.levelValues.
+		v := d.levelValues[len(d.levelValues)-1]
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, nil, fmt.Sprintf(
+				"ordered level value %q is not an integer", v)
+		}
+		posByIdx[n] = i
+	}
+	// Convert each bound workload into an orderedAllocation positioned at
+	// its current chain-index range. Bound workloads outside the visible
+	// orderedDomains are dropped (they belong to a different parent).
+	bound := make([]orderedAllocation, 0, len(s.boundOrderedAllocations))
+	for _, b := range s.boundOrderedAllocations {
+		startPos, ok := posByIdx[b.start]
+		if !ok {
+			continue
+		}
+		bound = append(bound, orderedAllocation{
+			id:        string(b.ref),
+			start:     startPos,
+			size:      b.size,
+			priority:  b.priority,
+			boundAt:   b.boundAt,
+			evictable: b.evictable,
+		})
+	}
+
+	allocator := &orderedAllocator{
+		chainSize: chainSize,
+		bound:     bound,
+	}
+	plan := allocator.schedule(orderedRequest{
+		size:     int(slicesNeeded),
+		priority: requestPriority,
+	}, budget)
+	if plan.pending {
+		return nil, nil, plan.pendingReason
+	}
+
+	// Translate placement back into the picked domain list. Each picked
+	// position takes one slice; honour leader-at-rank-0 if leaderCount > 0.
+	picked := make([]*domain, 0, slicesNeeded)
+	for i := int32(0); i < slicesNeeded; i++ {
+		d := orderedDomains[plan.placement+int(i)]
+		d.sliceState = 1
+		d.state = sliceSize
+		if leaderCount > 0 && i == 0 {
+			d.leaderState = 1
+		} else {
+			d.leaderState = 0
+		}
+		// Propagate the assignment down the tree so the subsequent
+		// lower-level loop (which iterates children of each picked domain)
+		// sees consistent capacity. This is necessary because fillInCounts
+		// computed leaf capacities BEFORE compaction, treating chain-indices
+		// occupied by to-be-evicted workloads as full. After the allocator
+		// chose to evict them, those leaves are conceptually free again.
+		// We surface that here by writing the assignment-shape state onto
+		// the first child path. For chain topologies this is exactly one
+		// host per chain-index, so the propagation collapses to a single
+		// child update.
+		propagateDomainStateForOrderedPick(d, sliceSize)
+		picked = append(picked, d)
+	}
+
+	// Convert evictions back to Workload references.
+	evictions := make([]workload.Reference, 0, len(plan.evictions))
+	for _, ev := range plan.evictions {
+		evictions = append(evictions, workload.Reference(ev.id))
+	}
+	return picked, evictions, ""
+}
+
+// propagateDomainStateForOrderedPick walks down from an ordered-level
+// domain marked with state=sliceSize/sliceState=1 and re-arms its single
+// child path's state so the subsequent lower-level descent sees a
+// consistent capacity to fulfill the request. For chain topologies (one
+// host per ordered domain) this collapses to one child update; for
+// topologies with multiple hosts per ordered domain it picks the first
+// child arbitrarily, matching the orderedAllocator's "one slice per
+// ordered position" assumption.
+//
+// fillInCounts has already populated children's state assuming the chain
+// is in its pre-allocation shape; for picks that compact over evicted
+// workloads, the children of the freed ordered position have state=0.
+// This helper restores them.
+func propagateDomainStateForOrderedPick(d *domain, sliceSize int32) {
+	if len(d.children) == 0 {
+		return
+	}
+	// Pick the first child as the host that will receive the slice. The
+	// upstream lower-level loop will then deterministically select it as
+	// the leftmost-with-capacity candidate.
+	first := d.children[0]
+	first.state = sliceSize
+	first.sliceState = 1
+	if d.leaderState > 0 {
+		first.leaderState = 1
+		first.stateWithLeader = sliceSize
+		first.sliceStateWithLeader = 1
+	} else {
+		first.leaderState = 0
+		first.stateWithLeader = sliceSize
+		first.sliceStateWithLeader = 1
+	}
+	// Recurse: keep restoring state down to the leaf. For 3-level
+	// chain-name → chain-index → hostname this recursion depth is 1.
+	propagateDomainStateForOrderedPick(first, sliceSize)
+}
+
+// pickOrderedContiguousRun enforces the chain-adjacency invariant at an
+// ordered child level: from a list of children pre-sorted in numeric label
+// order, find the leftmost contiguous run of `slicesNeeded` children where
+// each has sliceState >= 1 (fits at least one slice). Updates each picked
+// child's state/sliceState/leaderState to reflect the assignment so the
+// downstream lower-level traversal sees the same shape it would after
+// updateCountsToMinimumGeneric.
+//
+// Returns nil if no such run exists — the caller is expected to convert
+// that into notFitMessage rather than fall through to capacity-first set
+// picking, since for ordered fabrics non-contiguous placement breaks the
+// rank-to-position invariant the user is paying for.
+//
+// Limitations (Chunk B minimum scope):
+//   - Each picked child takes exactly one slice; multi-slice-per-domain
+//     ordered allocations are not yet supported.
+//   - Leader is placed at the start of the run when leaderCount > 0
+//     (matches the LWS leader-at-rank-0 convention used by the ungater).
+func (s *TASFlavorSnapshot) pickOrderedContiguousRun(
+	sortedChildren []*domain,
+	slicesNeeded int32,
+	leaderCount int32,
+	sliceSize int32,
+) []*domain {
+	if slicesNeeded <= 0 {
+		return nil
+	}
+	runStart := -1
+	var runLen int32
+	for i, child := range sortedChildren {
+		if child.sliceState >= 1 {
+			if runStart < 0 {
+				runStart = i
+			}
+			runLen++
+			if runLen >= slicesNeeded {
+				picked := sortedChildren[runStart : runStart+int(slicesNeeded)]
+				for j, d := range picked {
+					d.sliceState = 1
+					d.state = sliceSize
+					if leaderCount > 0 && j == 0 {
+						d.leaderState = 1
+					} else {
+						d.leaderState = 0
+					}
+					// Mirror the assignment shape onto the leaf path so
+					// the subsequent lower-level loop sees consistent
+					// capacity. fillInCounts treats hosts that were
+					// already free as having sliceState=1, so this is a
+					// no-op for the first-fit case — but keeping the
+					// logic uniform with the compaction path simplifies
+					// reasoning.
+					propagateDomainStateForOrderedPick(d, sliceSize)
+				}
+				return picked
+			}
+		} else {
+			runStart = -1
+			runLen = 0
+		}
+	}
+	return nil
 }
 
 func newTASFlavorSnapshot(log logr.Logger, topologyName kueue.TopologyReference,
@@ -217,6 +554,33 @@ func (s *TASFlavorSnapshot) initialize() {
 		s.domains[domain.id] = domain
 		s.domainsPerLevel[len(domain.levelValues)-1][domain.id] = domain
 		s.initializeHelper(domain)
+	}
+	if s.hasOrderedLevels() {
+		s.sortOrderedLevelChildren()
+	}
+}
+
+// sortOrderedLevelChildren walks every parent domain whose child level is
+// marked Ordered and sorts that parent's children slice by integer
+// level-value order. This makes downstream traversals (lowerLevelDomains,
+// sortedDomains) emit ordered-level domains in the user's intended 1-D
+// sequence — e.g. chain-index 0,1,2,...,11 rather than the lex order
+// 0,1,10,11,2,3,... that the upstream lex tiebreaker produces.
+//
+// initializeHelper populates parent.children in iteration order over the
+// leaves map, which is non-deterministic in Go. We need a separate pass
+// after the tree is fully built.
+func (s *TASFlavorSnapshot) sortOrderedLevelChildren() {
+	for parentLevelIdx := 0; parentLevelIdx < len(s.levelKeys)-1; parentLevelIdx++ {
+		childLevelIdx := parentLevelIdx + 1
+		if !s.isOrderedLevel(childLevelIdx) {
+			continue
+		}
+		for _, parent := range s.domainsPerLevel[parentLevelIdx] {
+			slices.SortFunc(parent.children, func(a, b *domain) int {
+				return s.compareDomainLevelValues(a.levelValues, b.levelValues)
+			})
+		}
 	}
 }
 
@@ -397,6 +761,14 @@ func (r TASAssignmentsResult) Failure() *FailureInfo {
 type tasPodSetAssignmentResult struct {
 	TopologyAssignment *utiltas.TopologyAssignment
 	FailureReason      string
+	// CompactionEvictions lists Workloads the scheduler must preempt to
+	// realise this assignment. Populated only when the assignment was
+	// reached by relocating bound workloads at an Ordered topology level
+	// (compaction); empty for first-fit and for non-ordered topologies.
+	// The caller is responsible for converting these references into
+	// preemption candidates and triggering eviction through the existing
+	// preemption pipeline.
+	CompactionEvictions []workload.Reference
 }
 
 type FlavorTASRequests []TASPodSetRequests
@@ -422,6 +794,16 @@ type findTopologyAssignmentsOption struct {
 	simulateEmpty          bool
 	workload               *kueue.Workload
 	aggregatedDomainUsages map[utiltas.TopologyDomainID]resources.Requests
+	// compactionBudget caps the number of bound workloads the dispatch may
+	// relocate at an Ordered topology level to admit a fragmented request.
+	// Zero (the default) disables compaction; a positive value plumbs
+	// through to orderedAllocator.schedule as the budget. Sourced from the
+	// admitting ClusterQueue's Preemption.MaxEvictionsPerSchedulingPass.
+	compactionBudget int
+	// requestPriority is the pending workload's effective priority. Used by
+	// orderedAllocator to gate "may this victim be evicted by this request"
+	// (a victim is only evictable when victim.priority <= requestPriority).
+	requestPriority int32
 }
 
 // ExclusionStats tracks why nodes were excluded during TAS scheduling.
@@ -514,6 +896,24 @@ func WithSimulateEmpty(simulateEmpty bool) FindTopologyAssignmentsOption {
 	}
 }
 
+// WithCompactionBudget sets the maximum number of bound Workloads the
+// dispatch may relocate (compact) on an Ordered topology level when a
+// pending request can't first-fit. Zero disables compaction.
+func WithCompactionBudget(budget int) FindTopologyAssignmentsOption {
+	return func(o *findTopologyAssignmentsOption) {
+		o.compactionBudget = budget
+	}
+}
+
+// WithRequestPriority sets the pending Workload's effective priority,
+// used by compaction to enforce "victim priority ≤ request priority" —
+// a request never displaces a higher-priority bound workload.
+func WithRequestPriority(p int32) FindTopologyAssignmentsOption {
+	return func(o *findTopologyAssignmentsOption) {
+		o.requestPriority = p
+	}
+}
+
 func WithWorkload(wl *kueue.Workload) FindTopologyAssignmentsOption {
 	return func(o *findTopologyAssignmentsOption) {
 		o.workload = wl
@@ -593,10 +993,14 @@ func (s *TASFlavorSnapshot) FindTopologyAssignmentsForFlavor(flavorTASRequests F
 			}
 
 			// Normal path: no previous assignment or stale assignment
-			assignments, reason := s.findTopologyAssignment(workers, leader, assumedUsage, opts.simulateEmpty, "")
+			assignments, evictions, reason := s.findTopologyAssignment(workers, leader, assumedUsage, opts.simulateEmpty, "", opts.compactionBudget, opts.requestPriority)
 			for _, tr := range trs {
 				podSetName := tr.PodSet.Name
-				result[podSetName] = tasPodSetAssignmentResult{TopologyAssignment: assignments[podSetName], FailureReason: reason}
+				result[podSetName] = tasPodSetAssignmentResult{
+					TopologyAssignment:  assignments[podSetName],
+					FailureReason:       reason,
+					CompactionEvictions: evictions,
+				}
 			}
 
 			if reason != "" {
@@ -662,7 +1066,9 @@ func (s *TASFlavorSnapshot) findReplacementAssignment(
 		trCopy.PodSet.TopologyRequest.PodSetSliceRequiredTopology = effectiveSliceTopology
 		trCopy.PodSet.TopologyRequest.PodSetSliceSize = new(effectiveSliceSize)
 	}
-	replacementAssignment, reason := s.findTopologyAssignment(trCopy, nil, assumedUsage, false, requiredReplacementDomain)
+	// Replacement assignments don't trigger compaction (budget=0, priority=0):
+	// they reuse an existing admission's slot at the same chain-index.
+	replacementAssignment, _, reason := s.findTopologyAssignment(trCopy, nil, assumedUsage, false, requiredReplacementDomain, 0, 0)
 	if reason != "" {
 		return nil, nil, reason
 	}
@@ -826,7 +1232,15 @@ func (s *TASFlavorSnapshot) findTopologyAssignment(
 	workersTasPodSetRequests TASPodSetRequests,
 	leaderTasPodSetRequests *TASPodSetRequests,
 	assumedUsage map[utiltas.TopologyDomainID]resources.Requests,
-	simulateEmpty bool, requiredReplacementDomain utiltas.TopologyDomainID) (map[kueue.PodSetReference]*utiltas.TopologyAssignment, string) {
+	simulateEmpty bool, requiredReplacementDomain utiltas.TopologyDomainID,
+	compactionBudget int, requestPriority int32,
+) (map[kueue.PodSetReference]*utiltas.TopologyAssignment, []workload.Reference, string) {
+	// compactionEvictions accumulates Workload references the dispatch wants
+	// the caller to preempt to realise this assignment. Empty (nil) for the
+	// no-compaction path; populated when the ordered dispatch falls through
+	// to findCompactionPlan.
+	var compactionEvictions []workload.Reference
+
 	requirements := &topologyAssignmentPodRequirements{
 		assumedUsage:              assumedUsage,
 		requiredReplacementDomain: requiredReplacementDomain,
@@ -850,14 +1264,14 @@ func (s *TASFlavorSnapshot) findTopologyAssignment(
 	info := podset.FromPodSet(workersTasPodSetRequests.PodSet)
 	for _, podSetUpdate := range workersTasPodSetRequests.PodSetUpdates {
 		if err := info.Merge(podset.FromUpdate(podSetUpdate)); err != nil {
-			return nil, fmt.Sprintf("invalid podSetUpdate for PodSet %s, error: %s", workersTasPodSetRequests.PodSet.Name, err.Error())
+			return nil, nil, fmt.Sprintf("invalid podSetUpdate for PodSet %s, error: %s", workersTasPodSetRequests.PodSet.Name, err.Error())
 		}
 	}
 
 	// If slice topology is not requested then we can assume that slice is a single pod
 	sliceSize, reason := getSliceSizeWithSinglePodAsDefault(workersTasPodSetRequests.PodSet.TopologyRequest)
 	if len(reason) > 0 {
-		return nil, reason
+		return nil, nil, reason
 	}
 	state.sliceSize = sliceSize
 
@@ -866,28 +1280,28 @@ func (s *TASFlavorSnapshot) findTopologyAssignment(
 
 	topologyKey := s.levelKeyWithImpliedFallback(&workersTasPodSetRequests)
 	if topologyKey == nil {
-		return nil, "topology level not specified"
+		return nil, nil, "topology level not specified"
 	}
 	requestedLevelIdx, found := s.resolveLevelIdx(*topologyKey)
 	if !found {
-		return nil, fmt.Sprintf("no requested topology level: %s", *topologyKey)
+		return nil, nil, fmt.Sprintf("no requested topology level: %s", *topologyKey)
 	}
 	state.requestedLevelIdx = requestedLevelIdx
 
 	sliceTopologyKey := s.sliceLevelKeyWithDefault(workersTasPodSetRequests.PodSet.TopologyRequest, s.lowestLevel())
 	sliceLevelIdx, found := s.resolveLevelIdx(sliceTopologyKey)
 	if !found {
-		return nil, fmt.Sprintf("no requested topology level for slices: %s", sliceTopologyKey)
+		return nil, nil, fmt.Sprintf("no requested topology level for slices: %s", sliceTopologyKey)
 	}
 	state.sliceLevelIdx = sliceLevelIdx
 
 	if state.requestedLevelIdx > state.sliceLevelIdx {
-		return nil, fmt.Sprintf("podset slice topology %s is above the podset topology %s", sliceTopologyKey, *topologyKey)
+		return nil, nil, fmt.Sprintf("podset slice topology %s is above the podset topology %s", sliceTopologyKey, *topologyKey)
 	}
 
 	sliceSizeAtLevel, reason := s.buildSliceSizeAtLevel(workersTasPodSetRequests, state.sliceSize, state.sliceLevelIdx)
 	if len(reason) > 0 {
-		return nil, reason
+		return nil, nil, reason
 	}
 	state.sliceSizeAtLevel = sliceSizeAtLevel
 
@@ -900,7 +1314,7 @@ func (s *TASFlavorSnapshot) findTopologyAssignment(
 	if s.isLowestLevelNode {
 		sel, err := labels.ValidatedSelectorFromSet(info.NodeSelector)
 		if err != nil {
-			return nil, fmt.Sprintf("invalid node selectors: %s, reason: %s", info.NodeSelector, err)
+			return nil, nil, fmt.Sprintf("invalid node selectors: %s, reason: %s", info.NodeSelector, err)
 		}
 		requirements.selector = sel
 	} else {
@@ -911,7 +1325,7 @@ func (s *TASFlavorSnapshot) findTopologyAssignment(
 		if requiredAffinity := info.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution; requiredAffinity != nil {
 			affinitySelector, err := nodeaffinity.NewNodeSelector(requiredAffinity)
 			if err != nil {
-				return nil, fmt.Sprintf("invalid affinity node selectors: %s, reason: %s", requiredAffinity, err)
+				return nil, nil, fmt.Sprintf("invalid affinity node selectors: %s, reason: %s", requiredAffinity, err)
 			}
 			requirements.affinitySelector = affinitySelector
 		}
@@ -920,7 +1334,7 @@ func (s *TASFlavorSnapshot) findTopologyAssignment(
 			if len(preferredAffinity) > 0 {
 				prefTerms, err := nodeaffinity.NewPreferredSchedulingTerms(preferredAffinity)
 				if err != nil {
-					return nil, fmt.Sprintf("invalid preferred node affinity terms: %v, reason: %s", preferredAffinity, err)
+					return nil, nil, fmt.Sprintf("invalid preferred node affinity terms: %v, reason: %s", preferredAffinity, err)
 				}
 				requirements.preferredSchedulingTerms = prefTerms
 			}
@@ -951,7 +1365,7 @@ func (s *TASFlavorSnapshot) findTopologyAssignment(
 	if !useBalancedPlacement {
 		fitLevelIdx, currFitDomain, reason = s.findLevelWithFitDomains(state.requestedLevelIdx, state)
 		if len(reason) > 0 {
-			return nil, reason
+			return nil, nil, reason
 		}
 	}
 	// phase 2b: traverse the tree down level-by-level optimizing the number of
@@ -962,7 +1376,48 @@ func (s *TASFlavorSnapshot) findTopologyAssignment(
 	for ; currentLevelIdx < min(len(s.domainsPerLevel)-1, state.sliceLevelIdx) && !useBalancedPlacement; currentLevelIdx++ {
 		// If we are "above" the requested slice topology level and we don't run the balanced placement algorithm,
 		// we're greedily assigning pods/slices to all domains without checking what we've assigned to parent domains.
-		sortedLowerDomains := s.sortedDomains(s.lowerLevelDomains(currFitDomain), state.unconstrained)
+		childLevelIdx := currentLevelIdx + 1
+		lowerDomains := s.lowerLevelDomains(currFitDomain)
+		// At an ordered child level, enforce the chain-adjacency invariant
+		// by picking the leftmost contiguous run instead of the
+		// capacity-first set. The pre-sort done at initialize() is per-
+		// parent; lowerLevelDomains may aggregate children across parents,
+		// so re-sort defensively before scanning.
+		if s.isOrderedLevel(childLevelIdx) {
+			ordered := s.sortDomainsByLevelValues(lowerDomains)
+			slicesNeeded := state.count / state.sliceSize
+			// First try the zero-disruption path: leftmost contiguous run
+			// among already-free chain-indices.
+			if picked := s.pickOrderedContiguousRun(
+				ordered, slicesNeeded, state.leaderCount, state.sliceSize,
+			); picked != nil {
+				currFitDomain = picked
+				continue
+			}
+			// First-fit failed. If the caller authorised compaction, run
+			// the orderedAllocator over the bound workloads to find a plan
+			// that relocates up to `compactionBudget` of them.
+			if compactionBudget > 0 {
+				picked, evictions, reason := s.findCompactionPlan(
+					ordered, slicesNeeded, state.leaderCount, state.sliceSize,
+					requestPriority, compactionBudget,
+				)
+				if reason == "" {
+					currFitDomain = picked
+					compactionEvictions = append(compactionEvictions, evictions...)
+					continue
+				}
+				return nil, nil, fmt.Sprintf(
+					"no contiguous run of %d slices at ordered level %s, "+
+						"and no feasible compaction plan within budget %d: %s",
+					slicesNeeded, s.levelKeys[childLevelIdx], compactionBudget, reason)
+			}
+			return nil, nil, fmt.Sprintf(
+				"no contiguous run of %d slices at ordered level %s "+
+					"(compaction disabled)",
+				slicesNeeded, s.levelKeys[childLevelIdx])
+		}
+		sortedLowerDomains := s.sortedDomains(lowerDomains, state.unconstrained)
 		currFitDomain = s.updateCountsToMinimumGeneric(sortedLowerDomains, state.count, state.leaderCount, state.sliceSize, state.unconstrained, true)
 	}
 
@@ -1027,7 +1482,7 @@ func (s *TASFlavorSnapshot) findTopologyAssignment(
 
 	assignments[workersTasPodSetRequests.PodSet.Name] = s.buildAssignment(currFitDomain)
 
-	return assignments, ""
+	return assignments, compactionEvictions, ""
 }
 
 // buildSliceSizeAtLevel builds a map from topology level index to the slice
@@ -1550,9 +2005,11 @@ func (s *TASFlavorSnapshot) buildTopologyAssignmentForLevels(domains []*domain, 
 }
 
 func (s *TASFlavorSnapshot) buildAssignment(domains []*domain) *utiltas.TopologyAssignment {
-	// lex sort domains by their levelValues instead of IDs, as leaves' IDs can only contain the hostname
+	// Sort domains by their levelValues. At Ordered levels the comparison
+	// is numeric (so chain-index "10" sorts after "2"), elsewhere it is
+	// lex — same as upstream behaviour for unordered topologies.
 	slices.SortFunc(domains, func(a, b *domain) int {
-		return slices.Compare(a.levelValues, b.levelValues)
+		return s.compareDomainLevelValues(a.levelValues, b.levelValues)
 	})
 	levelIdx := 0
 	// assign only hostname values if topology defines it
@@ -1595,7 +2052,7 @@ func (s *TASFlavorSnapshot) sortedDomainsWithLeader(domains []*domain, unconstra
 			return cmp.Compare(a.stateWithLeader, b.stateWithLeader)
 		}
 
-		return slices.Compare(a.levelValues, b.levelValues)
+		return s.compareDomainLevelValues(a.levelValues, b.levelValues)
 	})
 	return result
 }
@@ -1628,7 +2085,7 @@ func (s *TASFlavorSnapshot) sortedDomains(domains []*domain, unconstrained bool)
 			return cmp.Compare(a.state, b.state)
 		}
 
-		return slices.Compare(a.levelValues, b.levelValues)
+		return s.compareDomainLevelValues(a.levelValues, b.levelValues)
 	})
 	return result
 }

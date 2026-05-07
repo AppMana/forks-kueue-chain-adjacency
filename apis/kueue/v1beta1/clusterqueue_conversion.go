@@ -26,6 +26,16 @@ import (
 //lint:file-ignore ST1003 "generated Convert_* calls below use underscores"
 //revive:disable:var-naming
 
+// Convert_v1beta2_ClusterQueuePreemption_To_v1beta1_ClusterQueuePreemption is
+// a manual conversion. The v1beta2 MaxEvictionsPerSchedulingPass field has no
+// v1beta1 equivalent and is silently dropped during downgrade. v1beta1 is
+// deprecated, and the field defaults to nil/0 (no compaction), so the loss
+// only affects ClusterQueues authored against v1beta2 that explicitly enabled
+// compaction before downgrading.
+func Convert_v1beta2_ClusterQueuePreemption_To_v1beta1_ClusterQueuePreemption(in *v1beta2.ClusterQueuePreemption, out *ClusterQueuePreemption, s conversionapi.Scope) error {
+	return autoConvert_v1beta2_ClusterQueuePreemption_To_v1beta1_ClusterQueuePreemption(in, out, s)
+}
+
 func (src *ClusterQueue) ConvertTo(dstRaw conversion.Hub) error {
 	dst := dstRaw.(*v1beta2.ClusterQueue)
 	return Convert_v1beta1_ClusterQueue_To_v1beta2_ClusterQueue(src, dst, nil)

@@ -480,6 +480,28 @@ func (s *Scheduler) processEntry(
 	}
 }
 
+// resolveTASCompactionTargets converts the assignment's
+// TASCompactionEvictions list (workload references) into the
+// preemption.Target shape the rest of the scheduler consumes for
+// fits() and simulation. Evictions whose workload can't be found in
+// the snapshot are silently skipped — that just means the workload
+// has already left, which is fine.
+func (s *Scheduler) resolveTASCompactionTargets(log logr.Logger, snapshot *schdcache.Snapshot, e *entry) []*preemption.Target {
+	if len(e.assignment.TASCompactionEvictions) == 0 {
+		return nil
+	}
+	out := make([]*preemption.Target, 0, len(e.assignment.TASCompactionEvictions))
+	for _, ref := range e.assignment.TASCompactionEvictions {
+		victim := snapshot.Workload(ref)
+		if victim == nil {
+			log.V(2).Info("TAS compaction victim not in snapshot", "victim", ref)
+			continue
+		}
+		out = append(out, &preemption.Target{WorkloadInfo: victim})
+	}
+	return out
+}
+
 // issueTASCompaction evicts the bound Workloads named by the assignment's
 // TASCompactionEvictions list so the chain layout can defragment, then
 // requeues the pending workload for the next scheduling cycle. It mirrors
@@ -695,7 +717,13 @@ func (s *Scheduler) updateAssignmentIfNeeded(log logr.Logger,
 	cq *schdcache.ClusterQueueSnapshot,
 	preemptedWorkloads preemption.PreemptedWorkloads) (workload.Usage, bool) {
 	usage := e.assignmentUsage(log)
-	fitsCheck := fits(snapshot, cq, &usage, preemptedWorkloads, e.preemptionTargets)
+	// TAS compaction evictions are workloads we will evict to defragment
+	// an Ordered topology level. From the fits()-check perspective they
+	// are equivalent to preemption targets — their resource usage will be
+	// gone after eviction — so resolve them through the snapshot and pass
+	// them in alongside the priority-preemption targets.
+	tasCompactionTargets := s.resolveTASCompactionTargets(log, snapshot, e)
+	fitsCheck := fits(snapshot, cq, &usage, preemptedWorkloads, append(slices.Clone(e.preemptionTargets), tasCompactionTargets...))
 	if fitsCheck == schdcache.FitsCheckNoTAS && features.Enabled(features.TASRecomputeAssignmentWithinSchedulingCycle) {
 		log.V(2).Info("Re-computing the assignment as it doesn't fit for TAS")
 		// Clear the last assignment so that we can start from the first flavor again and
@@ -705,7 +733,10 @@ func (s *Scheduler) updateAssignmentIfNeeded(log logr.Logger,
 		newAssignment, newTargets := s.getAssignments(log, &e.Info, snapshot)
 		e.recordAssignment(newAssignment, newTargets)
 		usage = e.assignmentUsage(log)
-		fitsCheck = fits(snapshot, cq, &usage, preemptedWorkloads, newTargets)
+		// The recomputed assignment carries its own (possibly different)
+		// compaction eviction list; resolve it again before re-checking.
+		tasCompactionTargets = s.resolveTASCompactionTargets(log, snapshot, e)
+		fitsCheck = fits(snapshot, cq, &usage, preemptedWorkloads, append(slices.Clone(newTargets), tasCompactionTargets...))
 		log.V(2).Info("Re-computed assignment", "newMode", newAssignment.RepresentativeMode())
 		// clear the assignment flavors as they are only used within a single scheduling cycle
 		e.NominationMapping = nil

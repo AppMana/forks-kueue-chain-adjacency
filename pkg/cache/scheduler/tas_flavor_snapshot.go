@@ -334,11 +334,21 @@ func (s *TASFlavorSnapshot) findCompactionPlan(
 		chainSize: chainSize,
 		bound:     bound,
 	}
+	s.log.V(2).Info("findCompactionPlan input",
+		"chainSize", chainSize,
+		"slicesNeeded", slicesNeeded,
+		"budget", budget,
+		"requestPriority", requestPriority,
+		"bound", fmt.Sprintf("%+v", bound),
+		"snapshotBoundCount", len(s.boundOrderedAllocations),
+	)
 	plan := allocator.schedule(orderedRequest{
 		size:     int(slicesNeeded),
 		priority: requestPriority,
 	}, budget)
 	if plan.pending {
+		s.log.V(2).Info("findCompactionPlan pending",
+			"reason", plan.pendingReason)
 		return nil, nil, plan.pendingReason
 	}
 

@@ -598,6 +598,8 @@ func (c *clusterQueue) updateWorkloadTASUsage(log logr.Logger, wi *workload.Info
 	key := workload.Key(wi.Obj)
 	log = log.WithValues("workload", key)
 	meta := boundMetaFromWorkload(wi)
+	log.V(3).Info("updateWorkloadTASUsage",
+		"op", op, "evictable", meta.evictable, "priority", meta.priority)
 	for tasFlavor, tasUsage := range wi.TASUsage() {
 		tasFlvCache := c.tasCache.Get(tasFlavor)
 		switch {

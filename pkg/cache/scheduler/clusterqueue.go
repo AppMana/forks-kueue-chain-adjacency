@@ -622,6 +622,13 @@ func (c *clusterQueue) updateWorkloadTASUsage(log logr.Logger, wi *workload.Info
 // for any workload. The job-integration controllers (LWS, JobSet, plain
 // Job) can later default the annotation per kind, mirroring the plan's
 // "LWS evictable, JobSet/Job not evictable" intent.
+//
+// The annotation is read from any of three locations, in order:
+//  1. The Workload object's own metadata.annotations.
+//  2. Any PodSet template's metadata.annotations (where the user
+//     typically places TAS annotations alongside
+//     podset-required-topology / podset-slice-required-topology).
+//  3. (Future) the parent's annotations via owner-ref lookup.
 func boundMetaFromWorkload(wi *workload.Info) wlBoundMeta {
 	out := wlBoundMeta{}
 	if wi == nil || wi.Obj == nil {
@@ -633,10 +640,25 @@ func boundMetaFromWorkload(wi *workload.Info) wlBoundMeta {
 	if cond := apimeta.FindStatusCondition(wi.Obj.Status.Conditions, kueue.WorkloadQuotaReserved); cond != nil {
 		out.boundAt = cond.LastTransitionTime.UnixNano()
 	}
-	if v := wi.Obj.Annotations["kueue.x-k8s.io/tas-ordered-evictable"]; v == "true" {
-		out.evictable = true
-	}
+	out.evictable = lookupEvictableAnnotation(wi.Obj)
 	return out
+}
+
+const orderedEvictableAnnotation = "kueue.x-k8s.io/tas-ordered-evictable"
+
+func lookupEvictableAnnotation(wl *kueue.Workload) bool {
+	if wl == nil {
+		return false
+	}
+	if wl.Annotations[orderedEvictableAnnotation] == "true" {
+		return true
+	}
+	for _, ps := range wl.Spec.PodSets {
+		if ps.Template.Annotations[orderedEvictableAnnotation] == "true" {
+			return true
+		}
+	}
+	return false
 }
 
 func updateFlavorUsage(newUsage resources.FlavorResourceQuantities, oldUsage resources.FlavorResourceQuantities, op usageOp) {

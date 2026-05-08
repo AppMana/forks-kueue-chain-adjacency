@@ -1,0 +1,87 @@
+# Build the chain-adjacency Kueue manager image and push it to ghcr.io
+# on every commit to the fork's default branch.  The published image is:
+#
+#   ghcr.io/appmana/kueue:chain-adjacency           (always the branch tip)
+#   ghcr.io/appmana/kueue:<git-tag>                 (immutable, e.g. v0.18.0-rc.1-18-g904ae0fcb)
+#   ghcr.io/appmana/kueue:chain-adjacency-<sha8>    (immutable, indexed by short SHA)
+#
+# Platforms: linux/amd64, linux/arm64.  We deliberately drop the s390x and
+# ppc64le platforms upstream Kueue ships for — this fork's only consumer is
+# x86 chain hardware plus Apple-Silicon developer machines.
+#
+# Build time on the GitHub-hosted runner is ~3-5 minutes per push.
+
+name: Build and push image
+
+on:
+  push:
+    branches: [chain-adjacency]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  # Cancel in-flight builds for the same branch — only the latest commit
+  # matters; avoids burning runner minutes on superseded builds.
+  group: build-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          # Tags are needed so `git describe --tags --dirty --always` (used by
+          # the Makefile to compute GIT_TAG) returns the upstream-style tag.
+          fetch-depth: 0
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute short SHA
+        id: sha
+        run: echo "short=$(git rev-parse --short=8 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        env:
+          IMAGE_REGISTRY: ghcr.io/appmana
+          PLATFORMS: linux/amd64,linux/arm64
+          RELEASE_BRANCH: chain-adjacency
+        run: |
+          set -euo pipefail
+          # Override IMAGE_BUILD_EXTRA_OPTS so the build_push_action's
+          # --provenance metadata for ghcr is correct, and add the
+          # branch-sha tag in addition to the GIT_TAG and RELEASE_BRANCH
+          # tags the Makefile already produces.
+          make image-push \
+              IMAGE_REGISTRY="${IMAGE_REGISTRY}" \
+              PLATFORMS="${PLATFORMS}" \
+              RELEASE_BRANCH="${RELEASE_BRANCH}" \
+              IMAGE_BUILD_EXTRA_OPTS="-t ${IMAGE_REGISTRY}/kueue:chain-adjacency-${{ steps.sha.outputs.short }}"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Image"
+            echo
+            echo "| Tag | Mutable? |"
+            echo "|---|---|"
+            echo "| \`ghcr.io/appmana/kueue:chain-adjacency\` | yes (branch tip) |"
+            echo "| \`ghcr.io/appmana/kueue:chain-adjacency-${{ steps.sha.outputs.short }}\` | no |"
+            echo "| \`ghcr.io/appmana/kueue:$(git describe --tags --dirty --always)\` | no |"
+          } >> "$GITHUB_STEP_SUMMARY"

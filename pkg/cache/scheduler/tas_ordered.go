@@ -38,9 +38,19 @@ import (
 // topology level. The allocator works in pure positions (0..chainSize-1) and
 // is unaware of Kueue-specific types; the snapshot integration translates.
 type orderedAllocation struct {
-	id        string
-	start     int
-	size      int
+	id    string
+	start int
+	// size is the number of slices the workload holds — the length of the
+	// contiguous run it needs when (re-)placed. It is NOT derived from the
+	// span of `positions`: a fragmented workload occupying {0,2} has
+	// size 2, not 3.
+	size int
+	// positions optionally lists the exact chain positions the allocation
+	// currently occupies, sorted ascending. nil means the contiguous run
+	// [start, start+size). A non-contiguous positions list models a
+	// workload whose pods drifted apart (e.g. LWS pod recreation during
+	// rolling node reboots); compaction re-places it contiguously.
+	positions []int
 	priority  int32
 	boundAt   int64
 	evictable bool
@@ -48,14 +58,56 @@ type orderedAllocation struct {
 
 func (a orderedAllocation) end() int { return a.start + a.size }
 
+// occupied returns the chain positions the allocation currently holds.
+func (a orderedAllocation) occupied() []int {
+	if a.positions != nil {
+		return a.positions
+	}
+	out := make([]int, 0, a.size)
+	for i := a.start; i < a.start+a.size; i++ {
+		out = append(out, i)
+	}
+	return out
+}
+
+// isContiguousAt reports whether the allocation already occupies exactly
+// the contiguous run [start, start+size). Used to filter no-op relocations:
+// re-placing a fragmented allocation is always a real eviction, even when
+// the new run begins at the old start position.
+func (a orderedAllocation) isContiguousAt(start int) bool {
+	if a.positions == nil {
+		return a.start == start
+	}
+	if len(a.positions) != a.size {
+		return false
+	}
+	for i, p := range a.positions {
+		if p != start+i {
+			return false
+		}
+	}
+	return true
+}
+
 func (a orderedAllocation) overlapsRun(start, size int) bool {
-	return a.start < start+size && start < a.end()
+	for _, p := range a.occupied() {
+		if p >= start && p < start+size {
+			return true
+		}
+	}
+	return false
 }
 
 // orderedRequest is a pending placement request.
 type orderedRequest struct {
 	size     int
 	priority int32
+	// preferredPositions lists chain positions the requesting workload
+	// previously occupied (its last-known assignment). Placement prefers
+	// runs overlapping these positions — weights and compile caches are
+	// node-local, so returning to previous nodes avoids a cold reload.
+	// A scoring preference only, never a hard constraint. nil disables it.
+	preferredPositions []int
 }
 
 // orderedEviction tells the caller to relocate the named allocation to a new
@@ -139,9 +191,20 @@ func (a *orderedAllocator) schedule(req orderedRequest, budget int) orderedPlan 
 				req.size, a.chainSize),
 		}
 	}
-	// First-fit on existing layout (zero-disruption path).
-	if start, ok := firstFitLeftmost(a.bound, a.chainSize, req.size); ok {
-		return orderedPlan{placement: start}
+	// Zero-disruption path: place into the existing layout. Among the
+	// candidate starts, prefer the one covering the most preferred (warm)
+	// positions; ties resolve leftmost, which reduces to plain first-fit
+	// when no preference is supplied.
+	free := computeFreeIntervals(a.bound, a.chainSize)
+	if starts := requestStartCandidates(free, req.size, req.preferredPositions); len(starts) > 0 {
+		best := starts[0]
+		bestOverlap := overlapWithRun(req.preferredPositions, best, req.size)
+		for _, s := range starts[1:] {
+			if ov := overlapWithRun(req.preferredPositions, s, req.size); ov > bestOverlap {
+				best, bestOverlap = s, ov
+			}
+		}
+		return orderedPlan{placement: best}
 	}
 	if budget == orderedBudgetNoCompact {
 		return orderedPlan{
@@ -152,6 +215,21 @@ func (a *orderedAllocator) schedule(req orderedRequest, budget int) orderedPlan 
 	return a.solveWithCompaction(req, budget)
 }
 
+// occupiedMask marks every chain position held by the given allocations,
+// clamped to [0, chainSize). Fragmented allocations mark exactly their
+// occupied positions — position gaps inside a fragmented workload stay free.
+func occupiedMask(bound []orderedAllocation, chainSize int) []bool {
+	occupied := make([]bool, chainSize)
+	for _, b := range bound {
+		for _, p := range b.occupied() {
+			if p >= 0 && p < chainSize {
+				occupied[p] = true
+			}
+		}
+	}
+	return occupied
+}
+
 // firstFitLeftmost finds the smallest start such that [start, start+size) is
 // fully free given the supplied bound set. Returns (start, true) on success.
 // O(chainSize) — trivially fast for any realistic chain.
@@ -159,19 +237,7 @@ func firstFitLeftmost(bound []orderedAllocation, chainSize, size int) (int, bool
 	if size <= 0 || size > chainSize {
 		return 0, false
 	}
-	occupied := make([]bool, chainSize)
-	for _, b := range bound {
-		lo, hi := b.start, b.end()
-		if lo < 0 {
-			lo = 0
-		}
-		if hi > chainSize {
-			hi = chainSize
-		}
-		for i := lo; i < hi; i++ {
-			occupied[i] = true
-		}
-	}
+	occupied := occupiedMask(bound, chainSize)
 	runLen := 0
 	for i := 0; i < chainSize; i++ {
 		if occupied[i] {
@@ -184,6 +250,49 @@ func firstFitLeftmost(bound []orderedAllocation, chainSize, size int) (int, bool
 		}
 	}
 	return 0, false
+}
+
+// requestStartCandidates returns deterministic candidate starts for a
+// size-cell contiguous run in the given free intervals: each interval's
+// leftmost and rightmost feasible start (the only Pareto-optimal choices
+// for keeping the remaining free space contiguous), plus a warm anchor at
+// the request's first preferred position when a run fits there. Sorted
+// ascending.
+func requestStartCandidates(free []interval, size int, preferred []int) []int {
+	var out []int
+	seen := make(map[int]bool, 3*len(free))
+	add := func(s int) {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	for _, iv := range free {
+		if iv.length() < size {
+			continue
+		}
+		add(iv.start)
+		add(iv.end - size)
+		if len(preferred) > 0 {
+			if anchor := preferred[0]; anchor >= iv.start && anchor+size <= iv.end {
+				add(anchor)
+			}
+		}
+	}
+	sort.Ints(out)
+	return out
+}
+
+// overlapWithRun counts how many of the given positions fall inside the
+// run [start, start+size) — the cache-warmth score of a placement.
+func overlapWithRun(positions []int, start, size int) int {
+	n := 0
+	for _, p := range positions {
+		if p >= start && p < start+size {
+			n++
+		}
+	}
+	return n
 }
 
 // solveWithCompaction performs the exhaustive search, capped by budget.
@@ -238,6 +347,7 @@ func (a *orderedAllocator) solveWithCompaction(req orderedRequest, budget int) o
 	var best *orderedPlan
 	var bestSortedVictims []orderedAllocation
 	var bestRelocDist int
+	var bestWarmth int
 
 	for mask := 0; mask < 1<<n; mask++ {
 		if bits.OnesCount(uint(mask)) > maxSubsetSize {
@@ -255,24 +365,25 @@ func (a *orderedAllocator) solveWithCompaction(req orderedRequest, budget int) o
 		staying = append(staying, pinned...)
 		staying = append(staying, keepEvictables...)
 
-		plan, ok := tryPlanWithEvictions(req, evictSet, staying, oldStart, a.chainSize)
-		if !ok {
-			continue
-		}
-		// Effective eviction count must still respect the budget after no-op
-		// moves are filtered out (a relocation that resolves to the same start
-		// is not a real eviction).
-		if budget != orderedBudgetOptimal && len(plan.evictions) > budget {
-			continue
-		}
-		sortedVictims := a.sortedVictimsDesc(plan.evictions, byID)
-		relocDist := totalRelocationDistance(plan, oldStart, byID)
-		if best == nil ||
-			a.comparePrecomputed(plan, sortedVictims, relocDist, *best, bestSortedVictims, bestRelocDist) < 0 {
-			cp := plan
-			best = &cp
-			bestSortedVictims = sortedVictims
-			bestRelocDist = relocDist
+		for _, plan := range tryPlansWithEvictions(req, evictSet, staying, byID, a.chainSize) {
+			// Effective eviction count must still respect the budget after
+			// no-op moves are filtered out (a relocation that leaves an
+			// allocation contiguous at its current start is not a real
+			// eviction).
+			if budget != orderedBudgetOptimal && len(plan.evictions) > budget {
+				continue
+			}
+			sortedVictims := a.sortedVictimsDesc(plan.evictions, byID)
+			relocDist := totalRelocationDistance(plan, oldStart, byID)
+			warmth := planWarmth(plan, req, byID)
+			if best == nil ||
+				a.comparePrecomputed(plan, sortedVictims, relocDist, warmth, *best, bestSortedVictims, bestRelocDist, bestWarmth) < 0 {
+				cp := plan
+				best = &cp
+				bestSortedVictims = sortedVictims
+				bestRelocDist = relocDist
+				bestWarmth = warmth
+			}
 		}
 	}
 	if best == nil {
@@ -285,51 +396,72 @@ func (a *orderedAllocator) solveWithCompaction(req orderedRequest, budget int) o
 	return *best
 }
 
-// tryPlanWithEvictions attempts to construct a layout where:
+// tryPlansWithEvictions constructs every candidate layout for one eviction
+// subset:
 //   - staying allocations keep their current positions,
-//   - the request gets a contiguous run somewhere not overlapping staying,
-//   - the evictSet is re-placed into the remaining free space.
+//   - the request gets a contiguous run at one of the deterministic
+//     candidate starts (interval corners plus the warm anchor),
+//   - the evictSet is re-placed into the remaining free space, preferring
+//     runs overlapping each victim's previous positions.
 //
-// Returns (plan, true) on success. The plan's evictions list omits no-op moves
-// (where an evicted allocation lands on its original start).
-func tryPlanWithEvictions(
+// One plan is returned per feasible request start; the caller scores them.
+// Each plan's evictions list omits no-op moves — but re-placing a
+// FRAGMENTED allocation is always a real eviction, even when its new run
+// begins at its old start position ({0,2} → {0,1} moves the pod at 2).
+func tryPlansWithEvictions(
 	req orderedRequest,
 	evictSet, staying []orderedAllocation,
-	oldStart map[string]int,
+	byID map[string]orderedAllocation,
 	chainSize int,
-) (orderedPlan, bool) {
-	start, ok := firstFitLeftmost(staying, chainSize, req.size)
-	if !ok {
-		return orderedPlan{}, false
+) []orderedPlan {
+	freeForRequest := computeFreeIntervals(staying, chainSize)
+	starts := requestStartCandidates(freeForRequest, req.size, req.preferredPositions)
+	var plans []orderedPlan
+	for _, start := range starts {
+		occupied := make([]orderedAllocation, 0, len(staying)+1)
+		occupied = append(occupied, staying...)
+		occupied = append(occupied, orderedAllocation{
+			id:    "__request__",
+			start: start,
+			size:  req.size,
+		})
+		free := computeFreeIntervals(occupied, chainSize)
+		relocs, ok := placeEvictedWarm(evictSet, free)
+		if !ok {
+			continue
+		}
+		evictions := make([]orderedEviction, 0, len(relocs))
+		for _, r := range relocs {
+			if !byID[r.id].isContiguousAt(r.newStart) {
+				evictions = append(evictions, orderedEviction{
+					id:       r.id,
+					newStart: r.newStart,
+				})
+			}
+		}
+		sort.Slice(evictions, func(i, j int) bool {
+			if evictions[i].newStart != evictions[j].newStart {
+				return evictions[i].newStart < evictions[j].newStart
+			}
+			return evictions[i].id < evictions[j].id
+		})
+		plans = append(plans, orderedPlan{placement: start, evictions: evictions})
 	}
-	occupied := make([]orderedAllocation, 0, len(staying)+1)
-	occupied = append(occupied, staying...)
-	occupied = append(occupied, orderedAllocation{
-		id:    "__request__",
-		start: start,
-		size:  req.size,
-	})
-	free := computeFreeIntervals(occupied, chainSize)
-	relocs, ok := placeFirstFitDecreasing(evictSet, free)
-	if !ok {
-		return orderedPlan{}, false
-	}
-	evictions := make([]orderedEviction, 0, len(relocs))
-	for _, r := range relocs {
-		if r.newStart != oldStart[r.id] {
-			evictions = append(evictions, orderedEviction{
-				id:       r.id,
-				newStart: r.newStart,
-			})
+	return plans
+}
+
+// planWarmth scores a plan's cache warmth: the number of preferred (warm)
+// positions the request's placement covers, plus — for every relocated
+// victim — the number of the victim's current positions its new run keeps.
+// Higher is better: every warm cell is a node that skips a weight reload.
+func planWarmth(p orderedPlan, req orderedRequest, byID map[string]orderedAllocation) int {
+	total := overlapWithRun(req.preferredPositions, p.placement, req.size)
+	for _, e := range p.evictions {
+		if b, ok := byID[e.id]; ok {
+			total += overlapWithRun(b.occupied(), e.newStart, b.size)
 		}
 	}
-	sort.Slice(evictions, func(i, j int) bool {
-		if evictions[i].newStart != evictions[j].newStart {
-			return evictions[i].newStart < evictions[j].newStart
-		}
-		return evictions[i].id < evictions[j].id
-	})
-	return orderedPlan{placement: start, evictions: evictions}, true
+	return total
 }
 
 // interval is a half-open chain-index range [start, end).
@@ -338,37 +470,23 @@ type interval struct{ start, end int }
 func (iv interval) length() int { return iv.end - iv.start }
 
 // computeFreeIntervals returns the maximal contiguous free runs in
-// [0, chainSize) given a set of bound allocations. Bounds may overlap with the
-// chain bounds; the function clamps to the chain. Result is in increasing
-// start order, no zero-length runs.
+// [0, chainSize) given a set of bound allocations. Bounds may overlap with
+// the chain bounds; the function clamps to the chain. Fragmented
+// allocations free the positions inside their span they do not actually
+// occupy. Result is in increasing start order, no zero-length runs.
 func computeFreeIntervals(bound []orderedAllocation, chainSize int) []interval {
-	sorted := make([]orderedAllocation, len(bound))
-	copy(sorted, bound)
-	sort.Slice(sorted, func(i, j int) bool {
-		return sorted[i].start < sorted[j].start
-	})
-	result := make([]interval, 0, len(sorted)+1)
-	cursor := 0
-	for _, b := range sorted {
-		bs, be := b.start, b.end()
-		if bs < 0 {
-			bs = 0
+	occupied := occupiedMask(bound, chainSize)
+	var result []interval
+	runStart := -1
+	for i := 0; i <= chainSize; i++ {
+		free := i < chainSize && !occupied[i]
+		if free && runStart < 0 {
+			runStart = i
 		}
-		if be > chainSize {
-			be = chainSize
+		if !free && runStart >= 0 {
+			result = append(result, interval{start: runStart, end: i})
+			runStart = -1
 		}
-		if bs > cursor {
-			result = append(result, interval{start: cursor, end: bs})
-		}
-		if be > cursor {
-			cursor = be
-		}
-		if cursor >= chainSize {
-			break
-		}
-	}
-	if cursor < chainSize {
-		result = append(result, interval{start: cursor, end: chainSize})
 	}
 	return result
 }
@@ -379,15 +497,16 @@ type relocation struct {
 	newStart int
 }
 
-// placeFirstFitDecreasing tries to place each allocation in one of the free
-// intervals using first-fit-decreasing (largest first). Returns the chosen
-// starts; ok=false if any allocation doesn't fit.
-//
-// First-fit-decreasing is well-studied as a 2-competitive heuristic for 1-D
-// bin-packing, which is sufficient for our chain-sized inputs. The outer
-// solver enumerates subsets exhaustively, so even when this inner heuristic
-// fails on a particular subset, another subset choice may succeed.
-func placeFirstFitDecreasing(allocs []orderedAllocation, free []interval) ([]relocation, bool) {
+// placeEvictedWarm places each evicted allocation into the free intervals
+// in first-fit-decreasing order (largest first — the classic 2-competitive
+// 1-D bin-packing heuristic), preferring for each allocation the placement
+// that keeps the most of its previous positions (cache warmth), tiebroken
+// leftmost. When the warm-greedy pass fails to fit every allocation it
+// falls back to plain leftmost first-fit-decreasing, so warmth never costs
+// feasibility. The outer solver enumerates eviction subsets exhaustively,
+// so even when both passes fail on a particular subset, another subset
+// choice may succeed.
+func placeEvictedWarm(allocs []orderedAllocation, free []interval) ([]relocation, bool) {
 	if len(allocs) == 0 {
 		return nil, true
 	}
@@ -402,22 +521,80 @@ func placeFirstFitDecreasing(allocs []orderedAllocation, free []interval) ([]rel
 		}
 		return sorted[i].id < sorted[j].id
 	})
+	if result, ok := placeWithSelector(sorted, free, warmPlacement); ok {
+		return result, true
+	}
+	return placeWithSelector(sorted, free, leftmostPlacement)
+}
+
+// placementSelector picks (interval index, offset) for one allocation from
+// the remaining free intervals; ok=false if it fits nowhere.
+type placementSelector func(a orderedAllocation, remaining []interval) (ivIdx, offset int, ok bool)
+
+// leftmostPlacement is the plain first-fit choice: the start of the first
+// interval large enough.
+func leftmostPlacement(a orderedAllocation, remaining []interval) (int, int, bool) {
+	for i, iv := range remaining {
+		if iv.length() >= a.size {
+			return i, iv.start, true
+		}
+	}
+	return 0, 0, false
+}
+
+// warmPlacement picks, among each fitting interval's corner offsets and a
+// warm anchor at the allocation's first previous position, the placement
+// covering the most of the allocation's previous positions; ties resolve
+// to the smallest offset. With zero overlap everywhere this reduces to
+// leftmostPlacement (intervals are in ascending order and iv.start of the
+// first fitting interval is the smallest candidate offset).
+func warmPlacement(a orderedAllocation, remaining []interval) (int, int, bool) {
+	prev := a.occupied()
+	bestIdx, bestOffset, bestOverlap, found := 0, 0, -1, false
+	consider := func(idx, offset int) {
+		ov := overlapWithRun(prev, offset, a.size)
+		if !found || ov > bestOverlap {
+			bestIdx, bestOffset, bestOverlap, found = idx, offset, ov, true
+		}
+	}
+	for i, iv := range remaining {
+		if iv.length() < a.size {
+			continue
+		}
+		consider(i, iv.start)
+		consider(i, iv.end-a.size)
+		if len(prev) > 0 {
+			if anchor := prev[0]; anchor >= iv.start && anchor+a.size <= iv.end {
+				consider(i, anchor)
+			}
+		}
+	}
+	return bestIdx, bestOffset, found
+}
+
+// placeWithSelector runs the placement loop with the given selector,
+// splitting intervals around mid-interval placements.
+func placeWithSelector(sorted []orderedAllocation, free []interval, pick placementSelector) ([]relocation, bool) {
 	remaining := make([]interval, len(free))
 	copy(remaining, free)
 	result := make([]relocation, 0, len(sorted))
 	for _, a := range sorted {
-		placed := false
-		for i, iv := range remaining {
-			if iv.length() >= a.size {
-				result = append(result, relocation{id: a.id, newStart: iv.start})
-				remaining[i] = interval{start: iv.start + a.size, end: iv.end}
-				placed = true
-				break
-			}
-		}
-		if !placed {
+		idx, offset, ok := pick(a, remaining)
+		if !ok {
 			return nil, false
 		}
+		result = append(result, relocation{id: a.id, newStart: offset})
+		iv := remaining[idx]
+		next := make([]interval, 0, len(remaining)+1)
+		next = append(next, remaining[:idx]...)
+		if offset > iv.start {
+			next = append(next, interval{start: iv.start, end: offset})
+		}
+		if offset+a.size < iv.end {
+			next = append(next, interval{start: offset + a.size, end: iv.end})
+		}
+		next = append(next, remaining[idx+1:]...)
+		remaining = next
 	}
 	return result, true
 }
@@ -502,15 +679,18 @@ func totalRelocationDistance(
 //     most-expensive victim is cheaper than the other plan's most-expensive
 //     wins; ties on the next-most-expensive, etc. Minimises maximum
 //     disruption first.
-//  3. Total relocation distance — among equal-quality victim sets, prefer
+//  3. Cache warmth — among equal-disruption plans, prefer the one keeping
+//     more workload cells on their previous (warm) positions. Weights and
+//     compile caches are node-local; every warm cell skips a reload.
+//  4. Total relocation distance — among equal-warmth victim sets, prefer
 //     plans that move fewer cells.
-//  4. Leftmost placement — deterministic final tiebreak.
+//  5. Leftmost placement — deterministic final tiebreak.
 //
-// The pre-sorted victim lists are passed in to avoid re-sorting per
-// comparison in the hot loop.
+// The pre-sorted victim lists, distances and warmth scores are passed in to
+// avoid recomputing per comparison in the hot loop.
 func (a *orderedAllocator) comparePrecomputed(
-	planA orderedPlan, victimsA []orderedAllocation, distA int,
-	planB orderedPlan, victimsB []orderedAllocation, distB int,
+	planA orderedPlan, victimsA []orderedAllocation, distA, warmA int,
+	planB orderedPlan, victimsB []orderedAllocation, distB, warmB int,
 ) int {
 	if c := cmp.Compare(len(planA.evictions), len(planB.evictions)); c != 0 {
 		return c
@@ -523,6 +703,9 @@ func (a *orderedAllocator) comparePrecomputed(
 		if c := less(victimsA[i], victimsB[i]); c != 0 {
 			return c
 		}
+	}
+	if c := cmp.Compare(warmB, warmA); c != 0 { // higher warmth preferred
+		return c
 	}
 	if c := cmp.Compare(distA, distB); c != 0 {
 		return c

@@ -152,6 +152,14 @@ type TASFlavorSnapshot struct {
 	// (or by tests via setBoundOrderedAllocations); empty when there is no
 	// Ordered level on the topology or when no workloads are bound.
 	boundOrderedAllocations []boundOrderedAllocation
+
+	// lastKnownOrderedPositions maps recently-unbound Workloads to the
+	// Ordered-level index values they last occupied. Used as a cache-warmth
+	// preference when the same Workload is re-admitted (weights and compile
+	// caches are node-local; returning to the previous chain positions
+	// avoids a cold reload). Populated by the cache at snapshot-build time
+	// (or by tests via setLastKnownOrderedPositions).
+	lastKnownOrderedPositions map[workload.Reference][]int
 }
 
 // setLevelOrdered installs the per-level Ordered flags on the snapshot.
@@ -254,8 +262,15 @@ type boundOrderedAllocation struct {
 	ref workload.Reference
 	// start is the lowest Ordered-level index the workload occupies.
 	start int
-	// size is the number of consecutive Ordered-level indices it occupies.
+	// size is the number of slices the workload holds — the contiguous run
+	// length it needs when (re-)placed. NOT the min..max span of its
+	// current occupancy: a fragmented workload at indices {0,2} has size 2.
 	size int
+	// positions lists the exact Ordered-level index values the workload
+	// currently occupies, sorted ascending. nil means the contiguous run
+	// [start, start+size). Non-contiguous positions arise when pods drift
+	// apart (e.g. LWS pod recreation during rolling node reboots).
+	positions []int
 	// priority is the workload's effective priority (Workload.Spec.Priority,
 	// with a default of 0).
 	priority int32
@@ -275,6 +290,24 @@ func (s *TASFlavorSnapshot) setBoundOrderedAllocations(bs []boundOrderedAllocati
 	s.boundOrderedAllocations = slices.Clone(bs)
 }
 
+// setLastKnownOrderedPositions installs the last-known Ordered-level index
+// values of recently-unbound Workloads. Used by the cache when constructing
+// the snapshot, and by tests that want to drive warmth-preferring placement
+// directly.
+func (s *TASFlavorSnapshot) setLastKnownOrderedPositions(m map[workload.Reference][]int) {
+	s.lastKnownOrderedPositions = m
+}
+
+// preferredOrderedPositions returns the Ordered-level index values the given
+// pending Workload last occupied, or nil when unknown. The result feeds the
+// cache-warmth preference in ordered placement.
+func (s *TASFlavorSnapshot) preferredOrderedPositions(wl *kueue.Workload) []int {
+	if wl == nil || len(s.lastKnownOrderedPositions) == 0 {
+		return nil
+	}
+	return s.lastKnownOrderedPositions[workload.Key(wl)]
+}
+
 // findCompactionPlan converts the snapshot's bound workloads into the
 // orderedAllocator's input shape, runs schedule() with the supplied budget,
 // and returns the picked domains in numeric order plus the list of
@@ -292,13 +325,17 @@ func (s *TASFlavorSnapshot) findCompactionPlan(
 	sliceSize int32,
 	requestPriority int32,
 	budget int,
+	preferredPositions []int,
 ) ([]*domain, []workload.Reference, string) {
-	chainSize := len(orderedDomains)
-	if chainSize == 0 {
+	if len(orderedDomains) == 0 {
 		return nil, nil, "no domains at ordered level"
 	}
-	// Build a position lookup: chain-index integer → orderedDomains index.
-	posByIdx := make(map[int]int, chainSize)
+	// Parse the numeric label value of every visible domain. The allocator
+	// works in label space, normalised by the minimum label: chain positions
+	// are the integer label values themselves, so a missing node (rebooting,
+	// drained) leaves a hole that placement must not span — on a physical
+	// chain a dead node breaks adjacency between its neighbours.
+	labels := make([]int, len(orderedDomains))
 	for i, d := range orderedDomains {
 		// The numeric label value is at position firstOrderedLevelIdx; for
 		// the parent's children that is the *last* level position in
@@ -309,25 +346,71 @@ func (s *TASFlavorSnapshot) findCompactionPlan(
 			return nil, nil, fmt.Sprintf(
 				"ordered level value %q is not an integer", v)
 		}
-		posByIdx[n] = i
+		labels[i] = n
 	}
-	// Convert each bound workload into an orderedAllocation positioned at
-	// its current chain-index range. Bound workloads outside the visible
-	// orderedDomains are dropped (they belong to a different parent).
+	minLabel := slices.Min(labels)
+	chainSize := slices.Max(labels) - minLabel + 1
+	domainByPos := make(map[int]*domain, len(orderedDomains))
+	for i, d := range orderedDomains {
+		domainByPos[labels[i]-minLabel] = d
+	}
+
+	// Convert each bound workload into an orderedAllocation at its exact
+	// recorded positions — a fragmented workload occupies only the
+	// positions its recorded assignment names, and needs `size` contiguous
+	// cells when re-placed. Positions outside the visible label range are
+	// dropped (they belong to a different parent or to vanished nodes).
 	bound := make([]orderedAllocation, 0, len(s.boundOrderedAllocations))
+	covered := make([]bool, chainSize)
 	for _, b := range s.boundOrderedAllocations {
-		startPos, ok := posByIdx[b.start]
-		if !ok {
+		var positions []int
+		for _, p := range b.positionsOrRange() {
+			pos := p - minLabel
+			if pos < 0 || pos >= chainSize {
+				continue
+			}
+			positions = append(positions, pos)
+			covered[pos] = true
+		}
+		if len(positions) == 0 {
 			continue
 		}
 		bound = append(bound, orderedAllocation{
 			id:        string(b.ref),
-			start:     startPos,
+			start:     positions[0],
 			size:      b.size,
+			positions: positions,
 			priority:  b.priority,
 			boundAt:   b.boundAt,
 			evictable: b.evictable,
 		})
+	}
+	// Pin positions the request cannot use and no recorded assignment
+	// explains: holes (missing nodes) and occupancy outside Kueue's model
+	// (pods that drifted from their recorded assignment, non-TAS pods).
+	// The allocator must plan around reality, not just the recorded
+	// assignments — otherwise a compaction plan can collide with pods it
+	// doesn't know about.
+	for pos := 0; pos < chainSize; pos++ {
+		d, exists := domainByPos[pos]
+		if exists && (covered[pos] || d.sliceState >= 1) {
+			continue
+		}
+		bound = append(bound, orderedAllocation{
+			id:        fmt.Sprintf("__pinned_%d__", pos+minLabel),
+			start:     pos,
+			size:      1,
+			evictable: false,
+		})
+	}
+
+	// The request prefers the positions its workload last occupied
+	// (cache warmth), when they are visible on this chain.
+	var preferred []int
+	for _, p := range preferredPositions {
+		if pos := p - minLabel; pos >= 0 && pos < chainSize {
+			preferred = append(preferred, pos)
+		}
 	}
 
 	allocator := &orderedAllocator{
@@ -336,15 +419,18 @@ func (s *TASFlavorSnapshot) findCompactionPlan(
 	}
 	s.log.V(2).Info("findCompactionPlan input",
 		"chainSize", chainSize,
+		"minLabel", minLabel,
 		"slicesNeeded", slicesNeeded,
 		"budget", budget,
 		"requestPriority", requestPriority,
+		"preferredPositions", preferred,
 		"bound", fmt.Sprintf("%+v", bound),
 		"snapshotBoundCount", len(s.boundOrderedAllocations),
 	)
 	plan := allocator.schedule(orderedRequest{
-		size:     int(slicesNeeded),
-		priority: requestPriority,
+		size:               int(slicesNeeded),
+		priority:           requestPriority,
+		preferredPositions: preferred,
 	}, budget)
 	if plan.pending {
 		s.log.V(2).Info("findCompactionPlan pending",
@@ -356,7 +442,14 @@ func (s *TASFlavorSnapshot) findCompactionPlan(
 	// position takes one slice; honour leader-at-rank-0 if leaderCount > 0.
 	picked := make([]*domain, 0, slicesNeeded)
 	for i := int32(0); i < slicesNeeded; i++ {
-		d := orderedDomains[plan.placement+int(i)]
+		d, ok := domainByPos[plan.placement+int(i)]
+		if !ok {
+			// Cannot happen: holes are pinned, so no plan places the
+			// request across a missing chain position. Guard anyway.
+			return nil, nil, fmt.Sprintf(
+				"internal error: compaction placement spans missing chain position %d",
+				plan.placement+int(i)+minLabel)
+		}
 		d.sliceState = 1
 		d.state = sliceSize
 		if leaderCount > 0 && i == 0 {
@@ -384,6 +477,20 @@ func (s *TASFlavorSnapshot) findCompactionPlan(
 		evictions = append(evictions, workload.Reference(ev.id))
 	}
 	return picked, evictions, ""
+}
+
+// positionsOrRange returns the exact Ordered-level index values the
+// workload occupies: the recorded positions when present, otherwise the
+// contiguous range [start, start+size).
+func (b boundOrderedAllocation) positionsOrRange() []int {
+	if b.positions != nil {
+		return b.positions
+	}
+	out := make([]int, 0, b.size)
+	for i := b.start; i < b.start+b.size; i++ {
+		out = append(out, i)
+	}
+	return out
 }
 
 // propagateDomainStateForOrderedPick walks down from an ordered-level
@@ -425,10 +532,16 @@ func propagateDomainStateForOrderedPick(d *domain, sliceSize int32) {
 
 // pickOrderedContiguousRun enforces the chain-adjacency invariant at an
 // ordered child level: from a list of children pre-sorted in numeric label
-// order, find the leftmost contiguous run of `slicesNeeded` children where
-// each has sliceState >= 1 (fits at least one slice). Updates each picked
-// child's state/sliceState/leaderState to reflect the assignment so the
-// downstream lower-level traversal sees the same shape it would after
+// order, find a contiguous run of `slicesNeeded` children where each has
+// sliceState >= 1 (fits at least one slice). Contiguity is judged in LABEL
+// space: children whose integer label values are not consecutive do not
+// form a run, even when they are adjacent in the (gap-skipping) sorted
+// list — a missing node breaks physical chain adjacency. Among feasible
+// windows, the one covering the most of the workload's preferred (warm)
+// positions wins; ties resolve leftmost, which reduces to plain leftmost
+// first-fit when no preference is supplied. Updates each picked child's
+// state/sliceState/leaderState to reflect the assignment so the downstream
+// lower-level traversal sees the same shape it would after
 // updateCountsToMinimumGeneric.
 //
 // Returns nil if no such run exists — the caller is expected to convert
@@ -446,45 +559,111 @@ func (s *TASFlavorSnapshot) pickOrderedContiguousRun(
 	slicesNeeded int32,
 	leaderCount int32,
 	sliceSize int32,
+	preferredPositions []int,
 ) []*domain {
 	if slicesNeeded <= 0 {
 		return nil
 	}
-	runStart := -1
-	var runLen int32
+	need := int(slicesNeeded)
+	// Parse each child's numeric label. Unparsable labels fall back to
+	// array adjacency (adjacent to both neighbours), preserving the
+	// pre-existing behaviour for non-integer values.
+	labels := make([]int, len(sortedChildren))
+	parsed := make([]bool, len(sortedChildren))
 	for i, child := range sortedChildren {
-		if child.sliceState >= 1 {
+		v := child.levelValues[len(child.levelValues)-1]
+		if n, err := strconv.Atoi(v); err == nil {
+			labels[i] = n
+			parsed[i] = true
+		}
+	}
+	labelAdjacent := func(i int) bool { // child i adjacent to child i-1?
+		if i == 0 {
+			return false
+		}
+		if !parsed[i] || !parsed[i-1] {
+			return true
+		}
+		return labels[i] == labels[i-1]+1
+	}
+
+	// Scan the maximal free label-adjacent runs and collect candidate
+	// windows: each run's leftmost and rightmost window, plus a warm
+	// anchor starting at the smallest preferred position inside the run.
+	bestStart, bestOverlap := -1, -1
+	windowOverlap := func(startIdx int) int {
+		if len(preferredPositions) == 0 {
+			return 0
+		}
+		n := 0
+		for j := startIdx; j < startIdx+need; j++ {
+			if parsed[j] && slices.Contains(preferredPositions, labels[j]) {
+				n++
+			}
+		}
+		return n
+	}
+	consider := func(startIdx int) {
+		if ov := windowOverlap(startIdx); ov > bestOverlap {
+			bestStart, bestOverlap = startIdx, ov
+		}
+	}
+	runStart := -1
+	flushRun := func(endIdx int) { // current run is [runStart, endIdx)
+		if runStart < 0 {
+			return
+		}
+		if endIdx-runStart >= need {
+			consider(runStart)
+			consider(endIdx - need)
+			if len(preferredPositions) > 0 {
+				anchor := slices.Min(preferredPositions)
+				for j := runStart; j+need <= endIdx; j++ {
+					if parsed[j] && labels[j] == anchor {
+						consider(j)
+						break
+					}
+				}
+			}
+		}
+		runStart = -1
+	}
+	for i, child := range sortedChildren {
+		free := child.sliceState >= 1
+		if free && runStart >= 0 && !labelAdjacent(i) {
+			flushRun(i)
+		}
+		if free {
 			if runStart < 0 {
 				runStart = i
 			}
-			runLen++
-			if runLen >= slicesNeeded {
-				picked := sortedChildren[runStart : runStart+int(slicesNeeded)]
-				for j, d := range picked {
-					d.sliceState = 1
-					d.state = sliceSize
-					if leaderCount > 0 && j == 0 {
-						d.leaderState = 1
-					} else {
-						d.leaderState = 0
-					}
-					// Mirror the assignment shape onto the leaf path so
-					// the subsequent lower-level loop sees consistent
-					// capacity. fillInCounts treats hosts that were
-					// already free as having sliceState=1, so this is a
-					// no-op for the first-fit case — but keeping the
-					// logic uniform with the compaction path simplifies
-					// reasoning.
-					propagateDomainStateForOrderedPick(d, sliceSize)
-				}
-				return picked
-			}
 		} else {
-			runStart = -1
-			runLen = 0
+			flushRun(i)
 		}
 	}
-	return nil
+	flushRun(len(sortedChildren))
+	if bestStart < 0 {
+		return nil
+	}
+
+	picked := sortedChildren[bestStart : bestStart+need]
+	for j, d := range picked {
+		d.sliceState = 1
+		d.state = sliceSize
+		if leaderCount > 0 && j == 0 {
+			d.leaderState = 1
+		} else {
+			d.leaderState = 0
+		}
+		// Mirror the assignment shape onto the leaf path so the
+		// subsequent lower-level loop sees consistent capacity.
+		// fillInCounts treats hosts that were already free as having
+		// sliceState=1, so this is a no-op for the first-fit case — but
+		// keeping the logic uniform with the compaction path simplifies
+		// reasoning.
+		propagateDomainStateForOrderedPick(d, sliceSize)
+	}
+	return picked
 }
 
 func newTASFlavorSnapshot(log logr.Logger, topologyName kueue.TopologyReference,
@@ -1003,7 +1182,7 @@ func (s *TASFlavorSnapshot) FindTopologyAssignmentsForFlavor(flavorTASRequests F
 			}
 
 			// Normal path: no previous assignment or stale assignment
-			assignments, evictions, reason := s.findTopologyAssignment(workers, leader, assumedUsage, opts.simulateEmpty, "", opts.compactionBudget, opts.requestPriority)
+			assignments, evictions, reason := s.findTopologyAssignment(workers, leader, assumedUsage, opts.simulateEmpty, "", opts.compactionBudget, opts.requestPriority, s.preferredOrderedPositions(opts.workload))
 			for _, tr := range trs {
 				podSetName := tr.PodSet.Name
 				result[podSetName] = tasPodSetAssignmentResult{
@@ -1078,7 +1257,7 @@ func (s *TASFlavorSnapshot) findReplacementAssignment(
 	}
 	// Replacement assignments don't trigger compaction (budget=0, priority=0):
 	// they reuse an existing admission's slot at the same chain-index.
-	replacementAssignment, _, reason := s.findTopologyAssignment(trCopy, nil, assumedUsage, false, requiredReplacementDomain, 0, 0)
+	replacementAssignment, _, reason := s.findTopologyAssignment(trCopy, nil, assumedUsage, false, requiredReplacementDomain, 0, 0, nil)
 	if reason != "" {
 		return nil, nil, reason
 	}
@@ -1244,6 +1423,7 @@ func (s *TASFlavorSnapshot) findTopologyAssignment(
 	assumedUsage map[utiltas.TopologyDomainID]resources.Requests,
 	simulateEmpty bool, requiredReplacementDomain utiltas.TopologyDomainID,
 	compactionBudget int, requestPriority int32,
+	preferredPositions []int,
 ) (map[kueue.PodSetReference]*utiltas.TopologyAssignment, []workload.Reference, string) {
 	// compactionEvictions accumulates Workload references the dispatch wants
 	// the caller to preempt to realise this assignment. Empty (nil) for the
@@ -1399,7 +1579,7 @@ func (s *TASFlavorSnapshot) findTopologyAssignment(
 			// First try the zero-disruption path: leftmost contiguous run
 			// among already-free chain-indices.
 			if picked := s.pickOrderedContiguousRun(
-				ordered, slicesNeeded, state.leaderCount, state.sliceSize,
+				ordered, slicesNeeded, state.leaderCount, state.sliceSize, preferredPositions,
 			); picked != nil {
 				currFitDomain = picked
 				continue
@@ -1410,7 +1590,7 @@ func (s *TASFlavorSnapshot) findTopologyAssignment(
 			if compactionBudget > 0 {
 				picked, evictions, reason := s.findCompactionPlan(
 					ordered, slicesNeeded, state.leaderCount, state.sliceSize,
-					requestPriority, compactionBudget,
+					requestPriority, compactionBudget, preferredPositions,
 				)
 				if reason == "" {
 					currFitDomain = picked

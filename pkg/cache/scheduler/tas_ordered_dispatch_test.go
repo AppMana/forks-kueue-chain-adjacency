@@ -36,8 +36,10 @@ import (
 	tasindexer "sigs.k8s.io/kueue/pkg/controller/tas/indexer"
 	"sigs.k8s.io/kueue/pkg/resources"
 	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
+	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
 	testingnode "sigs.k8s.io/kueue/pkg/util/testingjobs/node"
 	testingpod "sigs.k8s.io/kueue/pkg/util/testingjobs/pod"
+	"sigs.k8s.io/kueue/pkg/workload"
 )
 
 const (
@@ -92,7 +94,7 @@ func TestOrderedDispatch_FindTopologyAssignment(t *testing.T) {
 		cpu      string
 	}
 	cases := map[string]struct {
-		ordered          []bool   // per-level Ordered flags; nil = all false
+		ordered          []bool // per-level Ordered flags; nil = all false
 		occupiedHosts    []podSpec
 		requestCount     int32
 		wantHostnames    []string // expected ordered list of hostnames in the assignment; nil if want failure
@@ -183,7 +185,7 @@ func TestOrderedDispatch_FindTopologyAssignment(t *testing.T) {
 			flavor := flavorInformation{TopologyName: "ordered-test"}
 			tasFlavorCache := tasCache.NewTASFlavorCache(topo, flavor)
 			snapshot := tasFlavorCache.snapshot(log,
-				tasCache.nodesCache.find(tasFlavorCache.flavor.NodeLabels, tasFlavorCache.topology.Levels))
+				tasCache.nodesCache.find(tasFlavorCache.flavor.NodeLabels, tasFlavorCache.topology.Levels), nil)
 
 			req := []TASPodSetRequests{{
 				PodSet: &kueue.PodSet{
@@ -371,7 +373,7 @@ func TestOrderedDispatch_Compaction(t *testing.T) {
 			flavor := flavorInformation{TopologyName: "ordered-test"}
 			tasFlavorCache := tasCache.NewTASFlavorCache(topo, flavor)
 			snapshot := tasFlavorCache.snapshot(log,
-				tasCache.nodesCache.find(tasFlavorCache.flavor.NodeLabels, tasFlavorCache.topology.Levels))
+				tasCache.nodesCache.find(tasFlavorCache.flavor.NodeLabels, tasFlavorCache.topology.Levels), nil)
 			snapshot.setBoundOrderedAllocations(tc.bound)
 
 			req := []TASPodSetRequests{{
@@ -441,6 +443,317 @@ func TestOrderedDispatch_Compaction(t *testing.T) {
 	}
 }
 
+// TestOrderedDispatch_FragmentedWorkloadCompaction encodes the 2026-07-10
+// production incident. A 12-node chain (indices 0..11) hosts a 2-slice LWS
+// workload ("llama") whose pods were recreated during rolling node reboots
+// and landed on chain-indices {0,2} — a non-contiguous assignment. A
+// 10-slice request then arrives with compaction budget 1.
+//
+// Evicting llama and re-placing it contiguously (2 slices) is sufficient:
+// 12 = 10 + 2. The compactor must produce exactly that plan. The recorded
+// failure on the incident build was:
+//
+//	no contiguous run of 10 slices at ordered level appmana.com/tb-chain-index,
+//	and no feasible compaction plan within budget 1: no feasible plan within budget 1
+//
+// caused by buildBoundOrderedAllocations collapsing llama's {0,2}
+// occupancy into the min..max span [0,3): the allocator then required a
+// contiguous THREE-cell re-placement for a two-slice workload, which can
+// never fit next to a 10-slice request on a 12-cell chain.
+//
+// This test drives the real conversion path (addUsageWithMeta →
+// buildBoundOrderedAllocations → findCompactionPlan) rather than
+// setBoundOrderedAllocations, so the fragmented-occupancy encoding itself
+// is under test.
+func TestOrderedDispatch_FragmentedWorkloadCompaction(t *testing.T) {
+	const chainName = "primary"
+	const chainSize = 12
+	const llamaRef = "inference/llama"
+
+	ctx, log := utiltesting.ContextWithLog(t)
+
+	nodes := make([]*corev1.Node, chainSize)
+	for i := 0; i < chainSize; i++ {
+		nodes[i] = makeOrderedChainNode(chainName, i, "1")
+	}
+	initialObjects := make([]client.Object, 0, len(nodes))
+	for i := range nodes {
+		initialObjects = append(initialObjects, nodes[i])
+	}
+	clientBuilder := utiltesting.NewClientBuilder()
+	clientBuilder.WithObjects(initialObjects...)
+	_ = tasindexer.SetupIndexes(ctx, utiltesting.AsIndexer(clientBuilder))
+	c := clientBuilder.Build()
+
+	tasCache := NewTASCache(c)
+	for i := range nodes {
+		tasCache.SyncNode(nodes[i])
+	}
+	topo := topologyInformation{
+		Levels:  orderedChainLevels,
+		Ordered: []bool{false, true, false},
+	}
+	flavor := flavorInformation{TopologyName: "ordered-test"}
+	tasFlavorCache := tasCache.NewTASFlavorCache(topo, flavor)
+
+	// llama holds chain-indices 0 and 2 — one pod per index, evictable.
+	// This is the recorded TAS usage, and it matches where the pods run.
+	tasFlavorCache.addUsageWithMeta(log, llamaRef, []workload.TopologyDomainRequests{
+		{Values: []string{"h0"}, SinglePodRequests: resources.Requests{corev1.ResourceCPU: 1000}, Count: 1},
+		{Values: []string{"h2"}, SinglePodRequests: resources.Requests{corev1.ResourceCPU: 1000}, Count: 1},
+	}, wlBoundMeta{evictable: true, boundAt: 100})
+
+	snapshot := tasFlavorCache.snapshot(log,
+		tasCache.nodesCache.find(tasFlavorCache.flavor.NodeLabels, tasFlavorCache.topology.Levels), nil)
+
+	req := []TASPodSetRequests{{
+		PodSet: &kueue.PodSet{
+			Name: kueue.PodSetReference("main"),
+			TopologyRequest: &kueue.PodSetTopologyRequest{
+				Required:                    ptr.To(tasOrderedChainName),
+				PodSetSliceRequiredTopology: ptr.To(tasOrderedChainIndex),
+				PodSetSliceSize:             ptr.To(int32(1)),
+			},
+			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{}},
+		},
+		SinglePodRequests: resources.Requests{corev1.ResourceCPU: 1000},
+		Count:             10,
+	}}
+
+	got := snapshot.FindTopologyAssignmentsForFlavor(req, WithCompactionBudget(1))
+	ps, ok := got[kueue.PodSetReference("main")]
+	if !ok {
+		t.Fatalf("no result for main podset; got %v", got)
+	}
+	if ps.FailureReason != "" {
+		t.Fatalf("expected a compaction plan (evict llama, budget 1 suffices), got failure: %s",
+			ps.FailureReason)
+	}
+	if ps.TopologyAssignment == nil {
+		t.Fatalf("nil assignment")
+	}
+
+	// One eviction: llama.
+	gotEvicted := make([]string, 0, len(ps.CompactionEvictions))
+	for _, ref := range ps.CompactionEvictions {
+		gotEvicted = append(gotEvicted, string(ref))
+	}
+	if len(gotEvicted) != 1 || gotEvicted[0] != llamaRef {
+		t.Errorf("evictions = %v, want [%s]", gotEvicted, llamaRef)
+	}
+
+	// The request gets a contiguous 10. The cache-warm plan re-places llama
+	// on {0,1} (overlapping its previous {0,2}) and gives the request 2..11.
+	gotPlacement := make([]string, 0, len(ps.TopologyAssignment.Domains))
+	for _, d := range ps.TopologyAssignment.Domains {
+		gotPlacement = append(gotPlacement, d.Values[len(d.Values)-1])
+	}
+	wantPlacement := []string{"h2", "h3", "h4", "h5", "h6", "h7", "h8", "h9", "h10", "h11"}
+	if !equalStringSlices(gotPlacement, wantPlacement) {
+		t.Errorf("placement = %v, want %v", gotPlacement, wantPlacement)
+	}
+}
+
+// TestOrderedDispatch_DriftedPodPinsPosition covers the model-vs-reality
+// divergence class: Kueue's recorded assignment says a workload sits at
+// {0,1}, but a pod actually occupies chain-index 5 outside Kueue's model
+// (LWS pod recreation is known to strand/bypass TAS assignments). The
+// compactor must treat the unexplained occupancy as pinned and stay
+// pending — the alternative is a "feasible" plan that plants the request
+// on top of the drifted pod and fails downstream with "Workload no longer
+// fits after processing another workload".
+//
+// Geometry: chain 12; llama recorded {0,1} (evictable); drifted pod on h5;
+// request 8, budget 1. Capacity passes (9 free cells ≥ 8) but no 8-run
+// exists: {2,3,4} and {6..11}. Even after evicting llama the pinned cell 5
+// splits the chain into a 5-run and a 6-run, so the correct answer is
+// pending. An unpinned model would "free" {0..11} minus nothing and plant
+// the request across position 5.
+func TestOrderedDispatch_DriftedPodPinsPosition(t *testing.T) {
+	const chainName = "primary"
+	const chainSize = 12
+	const llamaRef = "inference/llama"
+
+	ctx, log := utiltesting.ContextWithLog(t)
+
+	nodes := make([]*corev1.Node, chainSize)
+	for i := 0; i < chainSize; i++ {
+		nodes[i] = makeOrderedChainNode(chainName, i, "1")
+	}
+	// The drifted pod: real usage on h5 that no recorded assignment covers.
+	pods := []*corev1.Pod{occupyOrderedChainHost("h5", "1")}
+
+	initialObjects := make([]client.Object, 0, len(nodes)+len(pods))
+	for i := range nodes {
+		initialObjects = append(initialObjects, nodes[i])
+	}
+	for i := range pods {
+		initialObjects = append(initialObjects, pods[i])
+	}
+	clientBuilder := utiltesting.NewClientBuilder()
+	clientBuilder.WithObjects(initialObjects...)
+	_ = tasindexer.SetupIndexes(ctx, utiltesting.AsIndexer(clientBuilder))
+	c := clientBuilder.Build()
+
+	tasCache := NewTASCache(c)
+	for i := range nodes {
+		tasCache.SyncNode(nodes[i])
+	}
+	for i := range pods {
+		tasCache.Update(pods[i], log)
+	}
+	topo := topologyInformation{
+		Levels:  orderedChainLevels,
+		Ordered: []bool{false, true, false},
+	}
+	flavor := flavorInformation{TopologyName: "ordered-test"}
+	tasFlavorCache := tasCache.NewTASFlavorCache(topo, flavor)
+
+	// Recorded assignment: llama at {0,1} (evictable). Reality: a pod also
+	// runs on h5, unrecorded.
+	tasFlavorCache.addUsageWithMeta(log, llamaRef, []workload.TopologyDomainRequests{
+		{Values: []string{"h0"}, SinglePodRequests: resources.Requests{corev1.ResourceCPU: 1000}, Count: 1},
+		{Values: []string{"h1"}, SinglePodRequests: resources.Requests{corev1.ResourceCPU: 1000}, Count: 1},
+	}, wlBoundMeta{evictable: true, boundAt: 100})
+
+	snapshot := tasFlavorCache.snapshot(log,
+		tasCache.nodesCache.find(tasFlavorCache.flavor.NodeLabels, tasFlavorCache.topology.Levels), nil)
+
+	req := []TASPodSetRequests{{
+		PodSet: &kueue.PodSet{
+			Name: kueue.PodSetReference("main"),
+			TopologyRequest: &kueue.PodSetTopologyRequest{
+				Required:                    ptr.To(tasOrderedChainName),
+				PodSetSliceRequiredTopology: ptr.To(tasOrderedChainIndex),
+				PodSetSliceSize:             ptr.To(int32(1)),
+			},
+			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{}},
+		},
+		SinglePodRequests: resources.Requests{corev1.ResourceCPU: 1000},
+		Count:             8,
+	}}
+
+	got := snapshot.FindTopologyAssignmentsForFlavor(req, WithCompactionBudget(1))
+	ps, ok := got[kueue.PodSetReference("main")]
+	if !ok {
+		t.Fatalf("no result for main podset; got %v", got)
+	}
+	// The pinned drifted cell splits the chain: no 8-run exists at any
+	// budget. The compactor must say so instead of planting the request
+	// on top of the drifted pod.
+	if ps.FailureReason == "" {
+		gotPlacement := make([]string, 0, len(ps.TopologyAssignment.Domains))
+		for _, d := range ps.TopologyAssignment.Domains {
+			gotPlacement = append(gotPlacement, d.Values[len(d.Values)-1])
+		}
+		t.Fatalf("expected pending (drifted pod on h2 pins the position), got placement %v with evictions %v",
+			gotPlacement, ps.CompactionEvictions)
+	}
+	if !contains(ps.FailureReason, "no feasible compaction plan") {
+		t.Errorf("failure reason = %q, want a compaction-infeasibility reason", ps.FailureReason)
+	}
+}
+
+// TestOrderedDispatch_AdmissionWarmthPrefersLastKnownRun verifies the
+// cache-warmth preference at admission time: when several contiguous runs
+// can host the request, the run overlapping the workload's last-known
+// Ordered-level positions wins over the leftmost one. This is the
+// re-admission half of compaction self-healing — a workload evicted to
+// defragment the chain returns to its warm nodes instead of reloading
+// weights from scratch.
+func TestOrderedDispatch_AdmissionWarmthPrefersLastKnownRun(t *testing.T) {
+	const chainName = "primary"
+	const chainSize = 12
+
+	ctx, log := utiltesting.ContextWithLog(t)
+
+	nodes := make([]*corev1.Node, chainSize)
+	for i := 0; i < chainSize; i++ {
+		nodes[i] = makeOrderedChainNode(chainName, i, "1")
+	}
+	// Occupy indices 4 and 5 so two disjoint free runs exist: {0..3} and
+	// {6..11}. Both fit a 2-slice request.
+	pods := []*corev1.Pod{
+		occupyOrderedChainHost("h4", "1"),
+		occupyOrderedChainHost("h5", "1"),
+	}
+
+	initialObjects := make([]client.Object, 0, len(nodes)+len(pods))
+	for i := range nodes {
+		initialObjects = append(initialObjects, nodes[i])
+	}
+	for i := range pods {
+		initialObjects = append(initialObjects, pods[i])
+	}
+	clientBuilder := utiltesting.NewClientBuilder()
+	clientBuilder.WithObjects(initialObjects...)
+	_ = tasindexer.SetupIndexes(ctx, utiltesting.AsIndexer(clientBuilder))
+	c := clientBuilder.Build()
+
+	tasCache := NewTASCache(c)
+	for i := range nodes {
+		tasCache.SyncNode(nodes[i])
+	}
+	for i := range pods {
+		tasCache.Update(pods[i], log)
+	}
+	topo := topologyInformation{
+		Levels:  orderedChainLevels,
+		Ordered: []bool{false, true, false},
+	}
+	flavor := flavorInformation{TopologyName: "ordered-test"}
+	tasFlavorCache := tasCache.NewTASFlavorCache(topo, flavor)
+
+	// The pending workload previously ran on chain-indices {8,9} before it
+	// was evicted (e.g. by chain compaction). Its weights are warm there.
+	// Drive the production path: record the usage, then remove it — the
+	// cache's history feeds the snapshot's last-known positions.
+	wl := utiltestingapi.MakeWorkload("llama", "inference").Obj()
+	tasFlavorCache.addUsageWithMeta(log, workload.Key(wl), []workload.TopologyDomainRequests{
+		{Values: []string{"h8"}, SinglePodRequests: resources.Requests{corev1.ResourceCPU: 1000}, Count: 1},
+		{Values: []string{"h9"}, SinglePodRequests: resources.Requests{corev1.ResourceCPU: 1000}, Count: 1},
+	}, wlBoundMeta{evictable: true, boundAt: 100})
+	tasFlavorCache.removeUsage(log, workload.Key(wl))
+
+	snapshot := tasFlavorCache.snapshot(log,
+		tasCache.nodesCache.find(tasFlavorCache.flavor.NodeLabels, tasFlavorCache.topology.Levels), nil)
+
+	req := []TASPodSetRequests{{
+		PodSet: &kueue.PodSet{
+			Name: kueue.PodSetReference("main"),
+			TopologyRequest: &kueue.PodSetTopologyRequest{
+				Required:                    ptr.To(tasOrderedChainName),
+				PodSetSliceRequiredTopology: ptr.To(tasOrderedChainIndex),
+				PodSetSliceSize:             ptr.To(int32(1)),
+			},
+			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{}},
+		},
+		SinglePodRequests: resources.Requests{corev1.ResourceCPU: 1000},
+		Count:             2,
+	}}
+
+	got := snapshot.FindTopologyAssignmentsForFlavor(req, WithWorkload(wl))
+	ps, ok := got[kueue.PodSetReference("main")]
+	if !ok {
+		t.Fatalf("no result for main podset; got %v", got)
+	}
+	if ps.FailureReason != "" {
+		t.Fatalf("unexpected failure: %s", ps.FailureReason)
+	}
+	if ps.TopologyAssignment == nil {
+		t.Fatalf("nil assignment")
+	}
+	gotPlacement := make([]string, 0, len(ps.TopologyAssignment.Domains))
+	for _, d := range ps.TopologyAssignment.Domains {
+		gotPlacement = append(gotPlacement, d.Values[len(d.Values)-1])
+	}
+	wantPlacement := []string{"h8", "h9"}
+	if !equalStringSlices(gotPlacement, wantPlacement) {
+		t.Errorf("placement = %v, want %v (the run overlapping last-known positions {8,9} "+
+			"must beat the leftmost run {0,1})", gotPlacement, wantPlacement)
+	}
+}
+
 func sortStrings(s []string) {
 	if len(s) <= 1 {
 		return
@@ -484,7 +797,7 @@ func TestPickOrderedContiguousRun(t *testing.T) {
 		need          int32
 		leaderCount   int32
 		sliceSize     int32
-		wantStartIdx  int  // -1 if want nil
+		wantStartIdx  int // -1 if want nil
 		wantPickedLen int
 	}{
 		"empty layout, fits at 0": {
@@ -509,7 +822,7 @@ func TestPickOrderedContiguousRun(t *testing.T) {
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
 			s := &TASFlavorSnapshot{}
-			got := s.pickOrderedContiguousRun(c.domains, c.need, c.leaderCount, c.sliceSize)
+			got := s.pickOrderedContiguousRun(c.domains, c.need, c.leaderCount, c.sliceSize, nil)
 			if c.wantStartIdx == -1 {
 				if got != nil {
 					t.Fatalf("expected nil, got %d picked", len(got))

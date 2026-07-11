@@ -88,7 +88,7 @@ func (s *TASFlavorSnapshot) handleScaleUp(
 	// Elastic-resize deltas don't trigger compaction; the existing
 	// allocation already holds chain-index slots and the delta only adds
 	// or removes pods within those slots.
-	deltaAssignments, _, reason := s.findTopologyAssignment(deltaRequest, leader, assumedUsage, opts.simulateEmpty, "", 0, 0)
+	deltaAssignments, _, reason := s.findTopologyAssignment(deltaRequest, leader, assumedUsage, opts.simulateEmpty, "", 0, 0, nil)
 	if reason != "" {
 		result[workers.PodSet.Name] = tasPodSetAssignmentResult{FailureReason: reason}
 		return elasticPlacementResult{applied: true, assignments: result}

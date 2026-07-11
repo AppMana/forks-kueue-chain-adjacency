@@ -111,10 +111,7 @@ func checkPlanInvariants(t *testing.T, chainSize int, bound []orderedAllocation,
 	for _, b := range bound {
 		byID[b.id] = b
 	}
-	newStart := make(map[string]int, len(bound))
-	for _, b := range bound {
-		newStart[b.id] = b.start
-	}
+	evictedTo := make(map[string]int, len(plan.evictions))
 	for _, e := range plan.evictions {
 		b, ok := byID[e.id]
 		if !ok {
@@ -131,23 +128,33 @@ func checkPlanInvariants(t *testing.T, chainSize int, bound []orderedAllocation,
 		if e.newStart < 0 || e.newStart+b.size > chainSize {
 			t.Errorf("invariant: eviction %q out of bounds: newStart=%d size=%d", e.id, e.newStart, b.size)
 		}
-		if e.newStart == b.start {
-			t.Errorf("invariant: eviction %q is a no-op (newStart == oldStart=%d)", e.id, b.start)
+		if b.isContiguousAt(e.newStart) {
+			t.Errorf("invariant: eviction %q is a no-op (already contiguous at %d)", e.id, e.newStart)
 		}
-		newStart[e.id] = e.newStart
+		evictedTo[e.id] = e.newStart
 	}
-	// 3. No overlaps in final layout (request + all bounds at their final positions).
+	// 3. No overlaps in final layout (request + all bounds at their final
+	// positions). Evicted allocations occupy their new contiguous run;
+	// untouched allocations occupy their current (possibly fragmented)
+	// positions.
 	occupancy := make(map[int]string, chainSize)
 	for i := plan.placement; i < plan.placement+req.size; i++ {
 		occupancy[i] = "__request__"
 	}
-	for id, s := range newStart {
-		b := byID[id]
-		for i := s; i < s+b.size; i++ {
-			if existing, found := occupancy[i]; found {
-				t.Errorf("invariant: overlap at chain-index %d between %q and %q", i, existing, id)
+	for _, b := range bound {
+		var cells []int
+		if s, ok := evictedTo[b.id]; ok {
+			for i := s; i < s+b.size; i++ {
+				cells = append(cells, i)
 			}
-			occupancy[i] = id
+		} else {
+			cells = b.occupied()
+		}
+		for _, i := range cells {
+			if existing, found := occupancy[i]; found {
+				t.Errorf("invariant: overlap at chain-index %d between %q and %q", i, existing, b.id)
+			}
+			occupancy[i] = b.id
 		}
 	}
 }
@@ -632,9 +639,9 @@ func TestOrderedAllocator_BudgetSpectrum(t *testing.T) {
 	a := &orderedAllocator{chainSize: 12, bound: bounds}
 
 	cases := []struct {
-		budget          int
-		wantPending     bool
-		wantEvictCount  int
+		budget         int
+		wantPending    bool
+		wantEvictCount int
 	}{
 		{budget: 0, wantPending: true},
 		{budget: 1, wantPending: true},
@@ -784,7 +791,7 @@ func TestOrderedAllocator_TieBreakLowerPriority(t *testing.T) {
 		bound: []orderedAllocation{
 			allocPrio("hi", 4, 2, 100),
 			allocPrio("lo", 6, 2, 50),
-			alloc("X", 0, 4),  // pinned-by-position pre-existing
+			alloc("X", 0, 4), // pinned-by-position pre-existing
 			alloc("Y", 8, 4),
 		},
 	}
@@ -952,61 +959,61 @@ func TestComparePrecomputed_LexMax(t *testing.T) {
 		wantNegLess bool // true if a < b
 	}{
 		{
-			name:        "fewer evictions wins (1 vs 2)",
-			aPlan:       plan(0, 1), aVictims: mk(100), aDist: 0,
-			bPlan:       plan(0, 2), bVictims: mk(10, 10), bDist: 0,
+			name:  "fewer evictions wins (1 vs 2)",
+			aPlan: plan(0, 1), aVictims: mk(100), aDist: 0,
+			bPlan: plan(0, 2), bVictims: mk(10, 10), bDist: 0,
 			wantNegLess: true,
 		},
 		{
 			name: "lex-max: [50,50] beats [80,10] (50 < 80 at position 0)",
 			// Sum says [80,10]=90 < [50,50]=100, but lex says [50,50] wins.
-			aPlan:       plan(0, 2), aVictims: mk(50, 50), aDist: 0,
-			bPlan:       plan(0, 2), bVictims: mk(80, 10), bDist: 0,
+			aPlan: plan(0, 2), aVictims: mk(50, 50), aDist: 0,
+			bPlan: plan(0, 2), bVictims: mk(80, 10), bDist: 0,
 			wantNegLess: true,
 		},
 		{
 			name: "lex-max ties at position 0, breaks at position 1",
 			// Both have max=80. Second-max is 10 vs 50. [80,10] wins.
-			aPlan:       plan(0, 2), aVictims: mk(80, 10), aDist: 0,
-			bPlan:       plan(0, 2), bVictims: mk(80, 50), bDist: 0,
+			aPlan: plan(0, 2), aVictims: mk(80, 10), aDist: 0,
+			bPlan: plan(0, 2), bVictims: mk(80, 50), bDist: 0,
 			wantNegLess: true,
 		},
 		{
-			name: "lex-tied: smaller relocation distance wins",
-			aPlan:       plan(0, 2), aVictims: mk(50, 50), aDist: 5,
-			bPlan:       plan(0, 2), bVictims: mk(50, 50), bDist: 9,
+			name:  "lex-tied: smaller relocation distance wins",
+			aPlan: plan(0, 2), aVictims: mk(50, 50), aDist: 5,
+			bPlan: plan(0, 2), bVictims: mk(50, 50), bDist: 9,
 			wantNegLess: true,
 		},
 		{
-			name: "all-tied: leftmost placement wins",
-			aPlan:       plan(2, 2), aVictims: mk(50, 50), aDist: 0,
-			bPlan:       plan(8, 2), bVictims: mk(50, 50), bDist: 0,
+			name:  "all-tied: leftmost placement wins",
+			aPlan: plan(2, 2), aVictims: mk(50, 50), aDist: 0,
+			bPlan: plan(8, 2), bVictims: mk(50, 50), bDist: 0,
 			wantNegLess: true,
 		},
 		{
 			name: "sum-vs-lex divergence: [50,50] beats [10,90] under lex",
 			// Sum: [10,90]=100 < [50,50]=100 (tied). Lex: pos0 50<90.
 			// Lex picks [50,50].
-			aPlan:       plan(0, 2), aVictims: mk(50, 50), aDist: 0,
-			bPlan:       plan(0, 2), bVictims: mk(90, 10), bDist: 0,
+			aPlan: plan(0, 2), aVictims: mk(50, 50), aDist: 0,
+			bPlan: plan(0, 2), bVictims: mk(90, 10), bDist: 0,
 			wantNegLess: true,
 		},
 		{
 			name: "fewer evictions still wins even with worse priorities",
 			// [200] (sum 200) beats [10,10,10] (sum 30) on count alone.
-			aPlan:       plan(0, 1), aVictims: mk(200), aDist: 0,
-			bPlan:       plan(0, 3), bVictims: mk(10, 10, 10), bDist: 0,
+			aPlan: plan(0, 1), aVictims: mk(200), aDist: 0,
+			bPlan: plan(0, 3), bVictims: mk(10, 10, 10), bDist: 0,
 			wantNegLess: true,
 		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := a.comparePrecomputed(c.aPlan, c.aVictims, c.aDist, c.bPlan, c.bVictims, c.bDist)
+			got := a.comparePrecomputed(c.aPlan, c.aVictims, c.aDist, 0, c.bPlan, c.bVictims, c.bDist, 0)
 			if c.wantNegLess && got >= 0 {
 				t.Errorf("compare(a, b) = %d, want negative (a should win)", got)
 			}
 			// Antisymmetry: compare(b, a) should be opposite-signed.
-			rev := a.comparePrecomputed(c.bPlan, c.bVictims, c.bDist, c.aPlan, c.aVictims, c.aDist)
+			rev := a.comparePrecomputed(c.bPlan, c.bVictims, c.bDist, 0, c.aPlan, c.aVictims, c.aDist, 0)
 			if (got > 0) == (rev > 0) && got != 0 {
 				t.Errorf("antisymmetry violated: compare(a,b)=%d compare(b,a)=%d", got, rev)
 			}
@@ -1271,6 +1278,82 @@ func TestOrderedAllocator_JobSetBlocksMidChain(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Section 11: Cache warmth — re-placement prefers previous positions.
+//
+// Weights and compile caches are node-local; a workload re-placed onto
+// nodes it previously occupied skips a ~10 minute cold reload. The
+// preference is a scoring term, never a hard constraint.
+// ---------------------------------------------------------------------------
+
+// TestOrderedAllocator_WarmthPrefersPreviousPositions gives the evicted
+// victim two feasible re-placements: run {8,9} (closer to its recorded
+// start, so pure relocation-distance would pick it) and run {12,13}
+// (overlapping position 12, which the victim actually occupies). The
+// warm run must win.
+//
+// Geometry (chain=14):
+//
+//	P pinned at {10,11};
+//	V evictable, size 2, fragmented across positions {3,12};
+//	request size 8, budget 1.
+//
+// Only V's eviction can produce an 8-run. After the request takes [0,8),
+// the free intervals are {8,9} and {12,13}. Overlap with V's previous
+// positions {3,12}: run {8,9} → 0, run {12,13} → 1. Warmth picks 12.
+func TestOrderedAllocator_WarmthPrefersPreviousPositions(t *testing.T) {
+	bound := []orderedAllocation{
+		{id: "P", start: 10, size: 2, evictable: false, boundAt: 50},
+		{id: "V", start: 3, size: 2, positions: []int{3, 12}, evictable: true, boundAt: 100},
+	}
+	a := &orderedAllocator{chainSize: 14, bound: bound}
+	plan := a.schedule(orderedRequest{size: 8}, 1)
+	if plan.pending {
+		t.Fatalf("unexpected pending: %s", plan.pendingReason)
+	}
+	if plan.placement != 0 {
+		t.Errorf("placement = %d, want 0 (leftmost feasible)", plan.placement)
+	}
+	if len(plan.evictions) != 1 || plan.evictions[0].id != "V" {
+		t.Fatalf("evictions = %+v, want exactly [V]", plan.evictions)
+	}
+	if got := plan.evictions[0].newStart; got != 12 {
+		t.Errorf("V newStart = %d, want 12 (warm run {12,13} overlaps previous position 12; "+
+			"run {8,9} is closer to the recorded start but cold)", got)
+	}
+}
+
+// TestOrderedAllocator_FragmentedIncidentGeometry is the allocator-level
+// statement of the 2026-07-10 incident: a 2-slice workload fragmented at
+// {0,2} on a 12-cell chain, a 10-cell request, budget 1. The plan must
+// evict the fragmented workload and re-place it on its warm run {0,1}
+// (overlapping previous position 0), giving the request [2,12).
+func TestOrderedAllocator_FragmentedIncidentGeometry(t *testing.T) {
+	bound := []orderedAllocation{
+		{id: "llama", start: 0, size: 2, positions: []int{0, 2}, evictable: true, boundAt: 100},
+	}
+	a := &orderedAllocator{chainSize: 12, bound: bound}
+	plan := a.schedule(orderedRequest{size: 10}, 1)
+	if plan.pending {
+		t.Fatalf("unexpected pending: %s", plan.pendingReason)
+	}
+	if len(plan.evictions) != 1 || plan.evictions[0].id != "llama" {
+		t.Fatalf("evictions = %+v, want exactly [llama]", plan.evictions)
+	}
+	if plan.placement != 2 {
+		t.Errorf("placement = %d, want 2 (request takes [2,12) so llama keeps its warm node 0)",
+			plan.placement)
+	}
+	if got := plan.evictions[0].newStart; got != 0 {
+		t.Errorf("llama newStart = %d, want 0 (warm run {0,1})", got)
+	}
+	// Re-placing a fragmented allocation at a run beginning on its old
+	// start position is a REAL eviction, not a no-op: {0,2} → {0,1} moves
+	// the pod at position 2. The eviction must be reported (and counted
+	// against the budget) even though newStart == old start.
+	checkPlanInvariants(t, 12, bound, orderedRequest{size: 10}, plan)
 }
 
 func TestComputeFreeIntervals(t *testing.T) {

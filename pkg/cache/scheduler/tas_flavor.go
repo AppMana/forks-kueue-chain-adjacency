@@ -110,6 +110,13 @@ type TASFlavorCache struct {
 	// priority 0, admitted now" which is safe for non-ordered topologies.
 	wlMeta map[workload.Reference]wlBoundMeta
 
+	// wlUsageHistory retains the recorded usage of recently-unbound
+	// workloads (bounded FIFO, orderedUsageHistoryLimit entries) so
+	// re-admission can prefer their previous — cache-warm — chain
+	// positions. wlHistoryOrder tracks insertion order for eviction.
+	wlUsageHistory map[workload.Reference][]workload.TopologyDomainRequests
+	wlHistoryOrder []workload.Reference
+
 	// nonTasUsageCache maintains the usage coming from non-TAS pods,
 	// e.g. static Pods or DaemonSet pods.
 	nonTasUsageCache *nonTasUsageCache
@@ -124,6 +131,7 @@ func (t *tasCache) NewTASFlavorCache(topologyInfo topologyInformation,
 		usage:            make(map[utiltas.TopologyDomainID]resources.Requests),
 		wlUsage:          make(map[workload.Reference][]workload.TopologyDomainRequests),
 		wlMeta:           make(map[workload.Reference]wlBoundMeta),
+		wlUsageHistory:   make(map[workload.Reference][]workload.TopologyDomainRequests),
 		nonTasUsageCache: t.nonTasUsageCache,
 	}
 }
@@ -181,16 +189,20 @@ func (c *TASFlavorCache) snapshot(
 	// (start, size) from its per-domain placement.
 	if snapshot.hasOrderedLevels() {
 		snapshot.setBoundOrderedAllocations(c.buildBoundOrderedAllocations(snapshot))
+		snapshot.setLastKnownOrderedPositions(c.buildLastKnownOrderedPositions(snapshot))
 	}
 	return snapshot
 }
 
 // buildBoundOrderedAllocations turns the cache's wlUsage + wlMeta into the
 // ordered-allocation shape the snapshot's compaction path consumes. A
-// workload's chain-index range is derived from the integer values its
-// per-domain placement carries at the ordered level. Workloads whose
-// placement isn't on the ordered level (e.g. they're admitted on a
-// different flavor or before the snapshot's nodes existed) are dropped.
+// workload's chain-index positions are the integer values its per-domain
+// placement carries at the ordered level — the EXACT positions, not their
+// min..max span: a workload whose pods drifted to {0,2} occupies two
+// cells (and needs two contiguous cells when re-placed), not three.
+// Workloads whose placement isn't on the ordered level (e.g. they're
+// admitted on a different flavor or before the snapshot's nodes existed)
+// are dropped.
 func (c *TASFlavorCache) buildBoundOrderedAllocations(s *TASFlavorSnapshot) []boundOrderedAllocation {
 	orderedIdx := s.firstOrderedLevelIdx()
 	if orderedIdx < 0 {
@@ -201,36 +213,65 @@ func (c *TASFlavorCache) buildBoundOrderedAllocations(s *TASFlavorSnapshot) []bo
 	}
 	out := make([]boundOrderedAllocation, 0, len(c.wlUsage))
 	for ref, requests := range c.wlUsage {
-		var indices []int
-		for _, req := range requests {
-			// req.Values may be at the lowest level only when
-			// isLowestLevelNode is true; resolve via leaf lookup so the
-			// chain-index value is recoverable in either encoding.
-			leaf, ok := s.leaves[utiltas.DomainID(req.Values)]
-			if !ok || orderedIdx >= len(leaf.levelValues) {
-				continue
-			}
-			n, err := strconv.Atoi(leaf.levelValues[orderedIdx])
-			if err != nil {
-				continue
-			}
-			indices = append(indices, n)
-		}
+		indices := orderedIndicesForUsage(s, orderedIdx, requests)
 		if len(indices) == 0 {
 			continue
 		}
-		slices.Sort(indices)
-		start := indices[0]
-		size := indices[len(indices)-1] - start + 1
 		meta := c.wlMeta[ref]
 		out = append(out, boundOrderedAllocation{
 			ref:       ref,
-			start:     start,
-			size:      size,
+			start:     indices[0],
+			size:      len(indices),
+			positions: indices,
 			priority:  meta.priority,
 			boundAt:   meta.boundAt,
 			evictable: meta.evictable,
 		})
+	}
+	return out
+}
+
+// orderedIndicesForUsage resolves the Ordered-level integer index values a
+// set of per-domain requests occupies, deduplicated and sorted ascending.
+func orderedIndicesForUsage(s *TASFlavorSnapshot, orderedIdx int, requests []workload.TopologyDomainRequests) []int {
+	var indices []int
+	seen := make(map[int]bool, len(requests))
+	for _, req := range requests {
+		// req.Values may be at the lowest level only when
+		// isLowestLevelNode is true; resolve via leaf lookup so the
+		// chain-index value is recoverable in either encoding.
+		leaf, ok := s.leaves[utiltas.DomainID(req.Values)]
+		if !ok || orderedIdx >= len(leaf.levelValues) {
+			continue
+		}
+		n, err := strconv.Atoi(leaf.levelValues[orderedIdx])
+		if err != nil || seen[n] {
+			continue
+		}
+		seen[n] = true
+		indices = append(indices, n)
+	}
+	slices.Sort(indices)
+	return indices
+}
+
+// buildLastKnownOrderedPositions converts the usage history of
+// recently-unbound workloads into Ordered-level index values, feeding the
+// cache-warmth preference on re-admission. Workloads currently bound are
+// skipped (their live positions are in boundOrderedAllocations).
+func (c *TASFlavorCache) buildLastKnownOrderedPositions(s *TASFlavorSnapshot) map[workload.Reference][]int {
+	orderedIdx := s.firstOrderedLevelIdx()
+	if orderedIdx < 0 || len(c.wlUsageHistory) == 0 {
+		return nil
+	}
+	out := make(map[workload.Reference][]int, len(c.wlUsageHistory))
+	for ref, requests := range c.wlUsageHistory {
+		if _, bound := c.wlUsage[ref]; bound {
+			continue
+		}
+		if indices := orderedIndicesForUsage(s, orderedIdx, requests); len(indices) > 0 {
+			out[ref] = indices
+		}
 	}
 	return out
 }
@@ -254,6 +295,9 @@ func (c *TASFlavorCache) addUsageWithMeta(
 		c.removeUsage(log, key)
 	}
 	c.wlUsage[key] = slices.Clone(topologyRequests)
+	if c.wlMeta == nil {
+		c.wlMeta = make(map[workload.Reference]wlBoundMeta)
+	}
 	c.wlMeta[key] = meta
 	c.updateUsage(topologyRequests, add)
 }
@@ -264,9 +308,33 @@ func (c *TASFlavorCache) removeUsage(log logr.Logger, key workload.Reference) {
 		log.V(2).Info("Workload usage not found during removal from TAS flavor cache", "workload", key)
 		return
 	}
+	c.rememberUsage(key, value)
 	c.updateUsage(value, subtract)
 	delete(c.wlUsage, key)
 	delete(c.wlMeta, key)
+}
+
+// orderedUsageHistoryLimit bounds wlUsageHistory. 256 covers far more
+// unbind events than a chain can host between the eviction and the
+// re-admission of the same workload.
+const orderedUsageHistoryLimit = 256
+
+// rememberUsage stashes a workload's recorded usage as it unbinds, so a
+// later re-admission can prefer the same — cache-warm — chain positions.
+// Bounded FIFO: the oldest remembered workload is dropped past the limit.
+func (c *TASFlavorCache) rememberUsage(key workload.Reference, requests []workload.TopologyDomainRequests) {
+	if c.wlUsageHistory == nil {
+		c.wlUsageHistory = make(map[workload.Reference][]workload.TopologyDomainRequests)
+	}
+	if _, exists := c.wlUsageHistory[key]; !exists {
+		c.wlHistoryOrder = append(c.wlHistoryOrder, key)
+		if len(c.wlHistoryOrder) > orderedUsageHistoryLimit {
+			oldest := c.wlHistoryOrder[0]
+			c.wlHistoryOrder = c.wlHistoryOrder[1:]
+			delete(c.wlUsageHistory, oldest)
+		}
+	}
+	c.wlUsageHistory[key] = slices.Clone(requests)
 }
 
 func (c *TASFlavorCache) updateUsage(topologyRequests []workload.TopologyDomainRequests, op usageOp) {

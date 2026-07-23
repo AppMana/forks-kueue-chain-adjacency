@@ -427,8 +427,12 @@ func (s *TASFlavorSnapshot) findCompactionPlan(
 		"bound", fmt.Sprintf("%+v", bound),
 		"snapshotBoundCount", len(s.boundOrderedAllocations),
 	)
+	// The leader occupies its own exclusive chain slot at the head of the
+	// run (it is PP rank 0, a full chain member), so the run must be one
+	// position longer than the worker slice count.
+	runLen := slicesNeeded + leaderCount
 	plan := allocator.schedule(orderedRequest{
-		size:               int(slicesNeeded),
+		size:               int(runLen),
 		priority:           requestPriority,
 		preferredPositions: preferred,
 	}, budget)
@@ -439,9 +443,10 @@ func (s *TASFlavorSnapshot) findCompactionPlan(
 	}
 
 	// Translate placement back into the picked domain list. Each picked
-	// position takes one slice; honour leader-at-rank-0 if leaderCount > 0.
-	picked := make([]*domain, 0, slicesNeeded)
-	for i := int32(0); i < slicesNeeded; i++ {
+	// position takes one slice, except the run's first position when a
+	// leader is present: that slot is the leader's alone.
+	picked := make([]*domain, 0, runLen)
+	for i := int32(0); i < runLen; i++ {
 		d, ok := domainByPos[plan.placement+int(i)]
 		if !ok {
 			// Cannot happen: holes are pinned, so no plan places the
@@ -449,13 +454,6 @@ func (s *TASFlavorSnapshot) findCompactionPlan(
 			return nil, nil, fmt.Sprintf(
 				"internal error: compaction placement spans missing chain position %d",
 				plan.placement+int(i)+minLabel)
-		}
-		d.sliceState = 1
-		d.state = sliceSize
-		if leaderCount > 0 && i == 0 {
-			d.leaderState = 1
-		} else {
-			d.leaderState = 0
 		}
 		// Propagate the assignment down the tree so the subsequent
 		// lower-level loop (which iterates children of each picked domain)
@@ -467,7 +465,17 @@ func (s *TASFlavorSnapshot) findCompactionPlan(
 		// the first child path. For chain topologies this is exactly one
 		// host per chain-index, so the propagation collapses to a single
 		// child update.
-		propagateDomainStateForOrderedPick(d, sliceSize)
+		if leaderCount > 0 && i == 0 {
+			d.sliceState = 0
+			d.state = 0
+			d.leaderState = 1
+			propagateLeaderOnlyForOrderedPick(d)
+		} else {
+			d.sliceState = 1
+			d.state = sliceSize
+			d.leaderState = 0
+			propagateDomainStateForOrderedPick(d, sliceSize)
+		}
 		picked = append(picked, d)
 	}
 
@@ -530,6 +538,25 @@ func propagateDomainStateForOrderedPick(d *domain, sliceSize int32) {
 	propagateDomainStateForOrderedPick(first, sliceSize)
 }
 
+// propagateLeaderOnlyForOrderedPick mirrors
+// propagateDomainStateForOrderedPick for the run's exclusive leader slot:
+// the first child path receives leader capacity only, no worker slice.
+// The downstream updateCountsToMinimumGeneric descent for this domain runs
+// with (count=0, leaderCount=1) and its consume path requires the child's
+// leaderState to be set as leader capacity.
+func propagateLeaderOnlyForOrderedPick(d *domain) {
+	if len(d.children) == 0 {
+		return
+	}
+	first := d.children[0]
+	first.state = 0
+	first.sliceState = 0
+	first.leaderState = 1
+	first.stateWithLeader = 0
+	first.sliceStateWithLeader = 0
+	propagateLeaderOnlyForOrderedPick(first)
+}
+
 // pickOrderedContiguousRun enforces the chain-adjacency invariant at an
 // ordered child level: from a list of children pre-sorted in numeric label
 // order, find a contiguous run of `slicesNeeded` children where each has
@@ -564,7 +591,10 @@ func (s *TASFlavorSnapshot) pickOrderedContiguousRun(
 	if slicesNeeded <= 0 {
 		return nil
 	}
-	need := int(slicesNeeded)
+	// The leader occupies its own exclusive slot at the head of the run
+	// (it is a full chain member at PP rank 0), so the window is one wider
+	// than the worker slice count.
+	need := int(slicesNeeded + leaderCount)
 	// Parse each child's numeric label. Unparsable labels fall back to
 	// array adjacency (adjacent to both neighbours), preserving the
 	// pre-existing behaviour for non-integer values.
@@ -648,19 +678,23 @@ func (s *TASFlavorSnapshot) pickOrderedContiguousRun(
 
 	picked := sortedChildren[bestStart : bestStart+need]
 	for j, d := range picked {
-		d.sliceState = 1
-		d.state = sliceSize
-		if leaderCount > 0 && j == 0 {
-			d.leaderState = 1
-		} else {
-			d.leaderState = 0
-		}
 		// Mirror the assignment shape onto the leaf path so the
 		// subsequent lower-level loop sees consistent capacity.
 		// fillInCounts treats hosts that were already free as having
 		// sliceState=1, so this is a no-op for the first-fit case — but
 		// keeping the logic uniform with the compaction path simplifies
 		// reasoning.
+		if leaderCount > 0 && j == 0 {
+			// Exclusive leader slot: no worker slice on the run's head.
+			d.sliceState = 0
+			d.state = 0
+			d.leaderState = 1
+			propagateLeaderOnlyForOrderedPick(d)
+			continue
+		}
+		d.sliceState = 1
+		d.state = sliceSize
+		d.leaderState = 0
 		propagateDomainStateForOrderedPick(d, sliceSize)
 	}
 	return picked
@@ -1135,10 +1169,28 @@ func (s *TASFlavorSnapshot) FindTopologyAssignmentsForFlavor(flavorTASRequests F
 	groupedTASRequests := make(map[string]FlavorTASRequests)
 	groupsOrder := make([]string, 0)
 
+	// On an ordered flavor (chain topology), a workload's podsets must be
+	// placed as ONE contiguous run: independent placement lets a
+	// LeaderWorkerSet's leader (count 1) and worker (count N) podsets
+	// double-book chain slots (both allocations start at their own
+	// preferred/first-fit index, ignoring each other's picks -- observed
+	// live 2026-07-23: leader on chain index 1 AND the worker run starting
+	// at index 1, with index 0 skipped). Group them implicitly; the
+	// explicit kueue.x-k8s.io/podset-group-name annotation cannot be used
+	// here because upstream validation forbids it alongside the
+	// podset-slice-* annotations the chain layout requires.
+	// findLeaderAndWorkers only understands the 2-podset leader/worker
+	// shape, so restrict implicit grouping to exactly that.
+	implicitOrderedGroup := s.hasOrderedLevels() && len(flavorTASRequests) == 2 &&
+		flavorTASRequests[0].PodSetGroupName == nil && flavorTASRequests[1].PodSetGroupName == nil
+
 	for idx, tr := range flavorTASRequests {
 		groupKey := strconv.Itoa(idx)
-		if tr.PodSetGroupName != nil {
+		switch {
+		case tr.PodSetGroupName != nil:
 			groupKey = *tr.PodSetGroupName
+		case implicitOrderedGroup:
+			groupKey = "__implicit-ordered-group__"
 		}
 
 		if !slices.Contains(groupsOrder, groupKey) {

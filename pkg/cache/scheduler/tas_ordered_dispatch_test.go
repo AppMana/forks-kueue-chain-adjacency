@@ -815,8 +815,9 @@ func TestPickOrderedContiguousRun(t *testing.T) {
 		"runs separated by single occupied cell": {
 			domains: mk(1, 1, 1, 0, 1, 1, 1), need: 3, sliceSize: 1, wantStartIdx: 0, wantPickedLen: 3,
 		},
-		"leader is placed at start of run": {
-			domains: mk(0, 1, 1, 1, 1), need: 3, leaderCount: 1, sliceSize: 1, wantStartIdx: 1, wantPickedLen: 3,
+		"leader takes its own exclusive slot at start of run": {
+			// 3 worker slices + 1 leader-only head slot = a 4-wide window.
+			domains: mk(0, 1, 1, 1, 1), need: 3, leaderCount: 1, sliceSize: 1, wantStartIdx: 1, wantPickedLen: 4,
 		},
 	}
 	for name, c := range cases {
@@ -840,9 +841,15 @@ func TestPickOrderedContiguousRun(t *testing.T) {
 				t.Errorf("start idx = %d, want %d", gotStart, c.wantStartIdx)
 			}
 			if c.leaderCount > 0 {
-				// Leader bookkeeping: the first picked domain has leaderState=1.
+				// Leader bookkeeping: the run's head is an exclusive
+				// leader slot (leaderState=1, no worker slice), the rest
+				// are plain worker slices.
 				if got[0].leaderState != 1 {
 					t.Errorf("first picked leaderState = %d, want 1", got[0].leaderState)
+				}
+				if got[0].sliceState != 0 || got[0].state != 0 {
+					t.Errorf("leader slot carries a worker slice: sliceState=%d state=%d, want 0/0",
+						got[0].sliceState, got[0].state)
 				}
 				for i := 1; i < len(got); i++ {
 					if got[i].leaderState != 0 {
@@ -866,4 +873,112 @@ func stringContains(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+// TestOrderedDispatch_LeaderWorkerImplicitGroup reproduces the live
+// double-booking observed 2026-07-23 with a LeaderWorkerSet on the TB
+// chain: the leader podset (count 1) and worker podset (count N) were
+// placed as independent ordered allocations, so the worker run started on
+// the same chain index the leader had already taken and one chain-end node
+// was skipped entirely. On an ordered flavor, all podsets of one workload
+// must be grouped into a single contiguous run with the leader at the
+// run's first chain index -- without requiring the
+// kueue.x-k8s.io/podset-group-name annotation, which upstream validation
+// forbids alongside the slice-topology annotations the chain layout needs.
+func TestOrderedDispatch_LeaderWorkerImplicitGroup(t *testing.T) {
+	const chainName = "primary"
+	ctx, log := utiltesting.ContextWithLog(t)
+
+	nodes := make([]*corev1.Node, 6)
+	initialObjects := make([]client.Object, 0, 6)
+	for i := 0; i < 6; i++ {
+		nodes[i] = makeOrderedChainNode(chainName, i, "1")
+		initialObjects = append(initialObjects, nodes[i])
+	}
+	clientBuilder := utiltesting.NewClientBuilder()
+	clientBuilder.WithObjects(initialObjects...)
+	_ = tasindexer.SetupIndexes(ctx, utiltesting.AsIndexer(clientBuilder))
+	c := clientBuilder.Build()
+
+	tasCache := NewTASCache(c)
+	for i := range nodes {
+		tasCache.SyncNode(nodes[i])
+	}
+
+	topo := topologyInformation{
+		Levels:  orderedChainLevels,
+		Ordered: []bool{false, true, false},
+	}
+	flavor := flavorInformation{TopologyName: "ordered-test"}
+	tasFlavorCache := tasCache.NewTASFlavorCache(topo, flavor)
+	snapshot := tasFlavorCache.snapshot(log,
+		tasCache.nodesCache.find(tasFlavorCache.flavor.NodeLabels, tasFlavorCache.topology.Levels), nil)
+
+	topoReq := &kueue.PodSetTopologyRequest{
+		Required:                    ptr.To(tasOrderedChainName),
+		PodSetSliceRequiredTopology: ptr.To(tasOrderedChainIndex),
+		PodSetSliceSize:             ptr.To(int32(1)),
+	}
+	req := []TASPodSetRequests{
+		{
+			PodSet: &kueue.PodSet{
+				Name:            kueue.PodSetReference("leader"),
+				TopologyRequest: topoReq.DeepCopy(),
+				Template:        corev1.PodTemplateSpec{Spec: corev1.PodSpec{}},
+			},
+			SinglePodRequests: resources.Requests{corev1.ResourceCPU: 500},
+			Count:             1,
+		},
+		{
+			PodSet: &kueue.PodSet{
+				Name:            kueue.PodSetReference("worker"),
+				TopologyRequest: topoReq.DeepCopy(),
+				Template:        corev1.PodTemplateSpec{Spec: corev1.PodSpec{}},
+			},
+			SinglePodRequests: resources.Requests{corev1.ResourceCPU: 500},
+			Count:             5,
+		},
+	}
+
+	got := snapshot.FindTopologyAssignmentsForFlavor(req)
+	hostnamesOf := func(name string) []string {
+		ps, ok := got[kueue.PodSetReference(name)]
+		if !ok {
+			t.Fatalf("no result for %s podset; got %v", name, got)
+		}
+		if ps.FailureReason != "" {
+			t.Fatalf("%s podset failed: %s", name, ps.FailureReason)
+		}
+		if ps.TopologyAssignment == nil {
+			t.Fatalf("%s podset: nil assignment", name)
+		}
+		out := make([]string, 0, len(ps.TopologyAssignment.Domains))
+		for _, d := range ps.TopologyAssignment.Domains {
+			out = append(out, d.Values[len(d.Values)-1])
+		}
+		return out
+	}
+
+	leaderHosts := hostnamesOf("leader")
+	workerHosts := hostnamesOf("worker")
+
+	if len(leaderHosts) != 1 || leaderHosts[0] != "h0" {
+		t.Errorf("leader hosts = %v, want [h0] (leader at the run's first chain index)", leaderHosts)
+	}
+	wantWorkers := []string{"h1", "h2", "h3", "h4", "h5"}
+	if len(workerHosts) != len(wantWorkers) {
+		t.Fatalf("worker hosts = %v, want %v", workerHosts, wantWorkers)
+	}
+	for i, want := range wantWorkers {
+		if workerHosts[i] != want {
+			t.Errorf("worker[%d] = %q, want %q (full run must be contiguous after the leader, no overlap)", i, workerHosts[i], want)
+		}
+	}
+	seen := map[string]bool{leaderHosts[0]: true}
+	for _, h := range workerHosts {
+		if seen[h] {
+			t.Errorf("host %s double-booked across podsets", h)
+		}
+		seen[h] = true
+	}
 }

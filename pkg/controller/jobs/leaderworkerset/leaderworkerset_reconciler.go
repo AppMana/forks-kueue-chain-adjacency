@@ -28,6 +28,7 @@ import (
 	"golang.org/x/sync/errgroup"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
@@ -425,6 +426,25 @@ func (r *Reconciler) updateWorkload(ctx context.Context, lws *leaderworkersetv1.
 	log := ctrl.LoggerFrom(ctx).WithValues("workload", klog.KObj(wl))
 	log.V(3).Info("Update LeaderWorkerSet Workload")
 
+	// A Workload's PodSets are immutable, so a change to the group (leaderWorkerTemplate.size,
+	// the templates) can only be applied by recreating the Workload. The job framework instead
+	// finishes the diverged Workload with reason OutOfSync and nothing ever revives it, leaving
+	// the group with a dead Workload: the resize never admits and the Pods stay scheduling gated.
+	// Delete it here; the delete event triggers the reconcile that recreates it from the current
+	// LeaderWorkerSet spec.
+	if isFinishedOutOfSync(wl) {
+		log.V(2).Info("Deleting out of sync prebuilt Workload so it is recreated")
+		if err := r.deleteWorkload(ctx, wl); err != nil {
+			return err
+		}
+		r.record.Eventf(
+			lws, nil, corev1.EventTypeNormal, jobframework.ReasonDeletedWorkload,
+			"DeletedWorkload",
+			"Deleted out of sync Workload: %v", workload.Key(wl),
+		)
+		return nil
+	}
+
 	if queueName := jobframework.QueueNameForObject(lws); wl.Spec.QueueName != queueName {
 		log.V(2).Info("LeaderWorkerSet changed queue, updating workload")
 		wl.Spec.QueueName = queueName
@@ -447,6 +467,14 @@ func (r *Reconciler) updateWorkload(ctx context.Context, lws *leaderworkersetv1.
 	}
 
 	return nil
+}
+
+// isFinishedOutOfSync reports whether the Workload was finished by the job framework because
+// it diverged from its job. Workloads finished for any other reason (the job completed, was
+// deactivated, ...) are terminal on purpose and must be left alone.
+func isFinishedOutOfSync(wl *kueue.Workload) bool {
+	cond := apimeta.FindStatusCondition(wl.Status.Conditions, kueue.WorkloadFinished)
+	return cond != nil && cond.Status == metav1.ConditionTrue && cond.Reason == kueue.WorkloadFinishedReasonOutOfSync
 }
 
 func (r *Reconciler) deleteWorkload(ctx context.Context, wl *kueue.Workload) error {

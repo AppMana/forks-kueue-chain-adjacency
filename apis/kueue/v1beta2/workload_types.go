@@ -1026,6 +1026,11 @@ const (
 	// This is part of Concurrent Admission feature.
 	WorkloadEvictedByFlavorMigration string = "FlavorMigration"
 
+	// WorkloadEvictedByTASCompaction indicates the Workload was evicted so that an
+	// Ordered topology level could be compacted for another workload; it is
+	// requeued at once to be placed again.
+	WorkloadEvictedByTASCompaction string = "TASCompaction"
+
 	// WorkloadEvictedByPodsReadyTimeout indicates that the eviction took
 	// place due to a PodsReady timeout.
 	WorkloadEvictedByPodsReadyTimeout = "PodsReadyTimeout"

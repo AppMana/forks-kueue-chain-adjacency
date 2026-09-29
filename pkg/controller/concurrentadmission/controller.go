@@ -327,9 +327,7 @@ func (r *variantReconciler) syncVariantEvictionStatus(ctx context.Context, paren
 
 func (r *variantReconciler) clearWorkloadAdmission(ctx context.Context, wl *kueue.Workload, evCond *metav1.Condition) error {
 	return workload.PatchAdmissionStatus(ctx, r.client, wl, r.clock, func(w *kueue.Workload) (bool, error) {
-		setRequeued := (evCond.Reason == kueue.WorkloadEvictedByPreemption) ||
-			(evCond.Reason == kueue.WorkloadEvictedDueToNodeFailures)
-		updated := workload.SetRequeuedCondition(w, evCond.Reason, evCond.Message, setRequeued)
+		updated := workload.SetRequeuedCondition(w, evCond.Reason, evCond.Message, workload.RequeuedAfterEviction(evCond.Reason))
 		if workload.UnsetQuotaReservationWithCondition(w, "Pending", evCond.Message, r.clock.Now()) {
 			updated = true
 		}

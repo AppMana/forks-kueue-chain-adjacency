@@ -3877,3 +3877,26 @@ func TestShouldSkipClusterNomination(t *testing.T) {
 		})
 	}
 }
+
+func TestRequeuedAfterEviction(t *testing.T) {
+	// A workload evicted to make room is requeued at once; one evicted because it must not run
+	// (deactivated, a failed check, a PodsReady timeout with backoff) is requeued elsewhere or not
+	// at all. Chain compaction relocates a same-priority workload, so it goes straight back to the
+	// queue: before it had its own reason it reused FlavorMigration, whose workloads the
+	// Concurrent Admission controller requeues, and a compacted JobSet stayed Requeued=False.
+	cases := map[string]bool{
+		kueue.WorkloadEvictedByPreemption:       true,
+		kueue.WorkloadEvictedDueToNodeFailures:  true,
+		kueue.WorkloadEvictedByTASCompaction:    true,
+		kueue.WorkloadEvictedByFlavorMigration:  false,
+		kueue.WorkloadDeactivated:               false,
+		kueue.WorkloadEvictedByPodsReadyTimeout: false,
+	}
+	for reason, want := range cases {
+		t.Run(reason, func(t *testing.T) {
+			if got := RequeuedAfterEviction(reason); got != want {
+				t.Errorf("RequeuedAfterEviction(%q) = %v, want %v", reason, got, want)
+			}
+		})
+	}
+}

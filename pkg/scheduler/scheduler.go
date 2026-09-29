@@ -530,7 +530,7 @@ func (s *Scheduler) issueTASCompaction(ctx context.Context, log logr.Logger, e *
 			"victim", klog.KObj(wlCopy), "evictor", klog.KObj(e.Obj))
 		err := workload.Evict(
 			ctx, s.client, s.recorder, wlCopy,
-			kueue.WorkloadEvictedByFlavorMigration, message, "",
+			kueue.WorkloadEvictedByTASCompaction, message, "",
 			s.clock, exposeLqMetrics, s.roleTracker, s.customLabels,
 			workload.EvictWithLooseOnApply(), workload.EvictWithRetryOnConflictForPatch(),
 		)

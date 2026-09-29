@@ -804,6 +804,16 @@ func SetRequeueState(wl *kueue.Workload, waitUntil metav1.Time, incrementCount b
 	return updated
 }
 
+// RequeuedAfterEviction reports whether a workload evicted for reason goes straight back to
+// its queue (Requeued=True) once its job has stopped.
+func RequeuedAfterEviction(reason string) bool {
+	switch reason {
+	case kueue.WorkloadEvictedByPreemption, kueue.WorkloadEvictedDueToNodeFailures, kueue.WorkloadEvictedByTASCompaction:
+		return true
+	}
+	return false
+}
+
 // SetRequeuedCondition sets the WorkloadRequeued condition to true
 func SetRequeuedCondition(wl *kueue.Workload, reason, message string, status bool) bool {
 	condition := metav1.Condition{

@@ -216,14 +216,15 @@ func TestOrderedAllocator_FirstFitChoosesLeftmost(t *testing.T) {
 }
 
 func TestOrderedAllocator_FirstFitSkipsTooSmall(t *testing.T) {
-	// idle 0..3, B=2@4..5, idle 6..11; req=5 → only 6-cell gap fits.
+	// idle 0..3, B=2@4..5, idle 6..11; req=5 → only 6-cell gap fits. Both
+	// corners leave the same free shape; the one at the chain end wins.
 	runSchedulerTestCase(t, schedulerTestCase{
 		name:          "first-fit skips too-small run",
 		chainSize:     12,
 		bound:         []orderedAllocation{alloc("B", 4, 2)},
 		req:           orderedRequest{size: 5},
 		budget:        orderedBudgetNoCompact,
-		wantPlacement: 6,
+		wantPlacement: 7,
 	})
 }
 
@@ -313,8 +314,9 @@ func TestOrderedAllocator_RequestZeroOrNegative(t *testing.T) {
 
 func TestOrderedAllocator_PinnedBlocksEviction(t *testing.T) {
 	// A pinned at 0..3, B evictable at 4..5 — A overlaps any req start ≤ 3.
-	// req size=4 with budget=10 → first-fit at 6..9 (no eviction needed, B
-	// stays where it is, the 6..11 gap is size=6 so 6..9 fits the req).
+	// req size=4 with budget=10 → fits in the 6..11 gap without eviction (B
+	// stays where it is). Both corners leave a two-wide free run; the one at
+	// the chain end, 8..11, wins.
 	runSchedulerTestCase(t, schedulerTestCase{
 		name:      "first-fit succeeds without disturbing anything",
 		chainSize: 12,
@@ -324,7 +326,7 @@ func TestOrderedAllocator_PinnedBlocksEviction(t *testing.T) {
 		},
 		req:           orderedRequest{size: 4},
 		budget:        10,
-		wantPlacement: 6,
+		wantPlacement: 8,
 	})
 }
 

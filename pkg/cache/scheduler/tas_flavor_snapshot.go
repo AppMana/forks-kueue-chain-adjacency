@@ -620,7 +620,9 @@ func (s *TASFlavorSnapshot) pickOrderedContiguousRun(
 	// Scan the maximal free label-adjacent runs and collect candidate
 	// windows: each run's leftmost and rightmost window, plus a warm
 	// anchor starting at the smallest preferred position inside the run.
-	bestStart, bestOverlap := -1, -1
+	// chooseOrderedWindow then picks the window that keeps the remaining
+	// free space most contiguous, with warmth as a tiebreak. Positions here
+	// are indices into sortedChildren; a label gap splits runs.
 	windowOverlap := func(startIdx int) int {
 		if len(preferredPositions) == 0 {
 			return 0
@@ -633,24 +635,21 @@ func (s *TASFlavorSnapshot) pickOrderedContiguousRun(
 		}
 		return n
 	}
-	consider := func(startIdx int) {
-		if ov := windowOverlap(startIdx); ov > bestOverlap {
-			bestStart, bestOverlap = startIdx, ov
-		}
-	}
+	var free []interval
+	var candidates []int
 	runStart := -1
 	flushRun := func(endIdx int) { // current run is [runStart, endIdx)
 		if runStart < 0 {
 			return
 		}
+		free = append(free, interval{start: runStart, end: endIdx})
 		if endIdx-runStart >= need {
-			consider(runStart)
-			consider(endIdx - need)
+			candidates = append(candidates, runStart, endIdx-need)
 			if len(preferredPositions) > 0 {
 				anchor := slices.Min(preferredPositions)
 				for j := runStart; j+need <= endIdx; j++ {
 					if parsed[j] && labels[j] == anchor {
-						consider(j)
+						candidates = append(candidates, j)
 						break
 					}
 				}
@@ -659,11 +658,11 @@ func (s *TASFlavorSnapshot) pickOrderedContiguousRun(
 		runStart = -1
 	}
 	for i, child := range sortedChildren {
-		free := child.sliceState >= 1
-		if free && runStart >= 0 && !labelAdjacent(i) {
+		isFree := child.sliceState >= 1
+		if isFree && runStart >= 0 && !labelAdjacent(i) {
 			flushRun(i)
 		}
-		if free {
+		if isFree {
 			if runStart < 0 {
 				runStart = i
 			}
@@ -672,7 +671,8 @@ func (s *TASFlavorSnapshot) pickOrderedContiguousRun(
 		}
 	}
 	flushRun(len(sortedChildren))
-	if bestStart < 0 {
+	bestStart, ok := chooseOrderedWindow(free, need, 0, len(sortedChildren), candidates, windowOverlap)
+	if !ok {
 		return nil
 	}
 

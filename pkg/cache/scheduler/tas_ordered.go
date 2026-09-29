@@ -191,19 +191,14 @@ func (a *orderedAllocator) schedule(req orderedRequest, budget int) orderedPlan 
 				req.size, a.chainSize),
 		}
 	}
-	// Zero-disruption path: place into the existing layout. Among the
-	// candidate starts, prefer the one covering the most preferred (warm)
-	// positions; ties resolve leftmost, which reduces to plain first-fit
-	// when no preference is supplied.
+	// Zero-disruption path: place into the existing layout, choosing the
+	// window that keeps the remaining free space most contiguous (see
+	// chooseOrderedWindow); warm positions only break ties.
 	free := computeFreeIntervals(a.bound, a.chainSize)
 	if starts := requestStartCandidates(free, req.size, req.preferredPositions); len(starts) > 0 {
-		best := starts[0]
-		bestOverlap := overlapWithRun(req.preferredPositions, best, req.size)
-		for _, s := range starts[1:] {
-			if ov := overlapWithRun(req.preferredPositions, s, req.size); ov > bestOverlap {
-				best, bestOverlap = s, ov
-			}
-		}
+		best, _ := chooseOrderedWindow(free, req.size, 0, a.chainSize, starts, func(start int) int {
+			return overlapWithRun(req.preferredPositions, start, req.size)
+		})
 		return orderedPlan{placement: best}
 	}
 	if budget == orderedBudgetNoCompact {
@@ -281,6 +276,81 @@ func requestStartCandidates(free []interval, size int, preferred []int) []int {
 	}
 	sort.Ints(out)
 	return out
+}
+
+// chooseOrderedWindow picks, among candidate starts of a need-wide window,
+// the one that leaves the chain's free space most usable. free lists every
+// free run in [lo, hi), sorted, including runs too short for this request.
+// Candidates are compared by, in order:
+//
+//  1. the longest free run left behind (longer is better): a single-node
+//     workload goes into the tightest hole, not into the middle of the only
+//     run a multi-node job could use;
+//  2. the number of free runs left behind (fewer is better);
+//  3. warmth, the number of the workload's previous positions covered:
+//     node-local weights and compile caches make a return cheap, but only
+//     among windows that leave the free space equally usable;
+//  4. whether the window touches a chain end (lo or hi): a workload at an
+//     end never separates free space that later coalesces around it;
+//  5. the smallest start, for determinism.
+//
+// Candidates outside every free run are ignored; ok is false when none fits.
+func chooseOrderedWindow(free []interval, need, lo, hi int, candidates []int, warmth func(start int) int) (int, bool) {
+	type score struct {
+		longest, runs int
+		atEnd         bool
+		warm          int
+	}
+	evaluate := func(start int) (score, bool) {
+		sc := score{}
+		fits := false
+		account := func(length int) {
+			if length > 0 {
+				sc.runs++
+				sc.longest = max(sc.longest, length)
+			}
+		}
+		for _, iv := range free {
+			if start >= iv.start && start+need <= iv.end {
+				fits = true
+				account(start - iv.start)
+				account(iv.end - start - need)
+				continue
+			}
+			account(iv.length())
+		}
+		sc.atEnd = start == lo || start+need == hi
+		if warmth != nil {
+			sc.warm = warmth(start)
+		}
+		return sc, fits
+	}
+	better := func(a, b score) bool {
+		if a.longest != b.longest {
+			return a.longest > b.longest
+		}
+		if a.runs != b.runs {
+			return a.runs < b.runs
+		}
+		if a.warm != b.warm {
+			return a.warm > b.warm
+		}
+		return a.atEnd && !b.atEnd
+	}
+	sorted := append([]int(nil), candidates...)
+	sort.Ints(sorted)
+	best, found := 0, false
+	var bestScore score
+	for _, start := range sorted {
+		sc, fits := evaluate(start)
+		if !fits {
+			continue
+		}
+		if !found || better(sc, bestScore) {
+			best, bestScore, found = start, sc, true
+		}
+	}
+	return best, found
 }
 
 // overlapWithRun counts how many of the given positions fall inside the

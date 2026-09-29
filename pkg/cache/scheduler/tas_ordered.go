@@ -191,9 +191,9 @@ func (a *orderedAllocator) schedule(req orderedRequest, budget int) orderedPlan 
 				req.size, a.chainSize),
 		}
 	}
-	// Zero-disruption path: place into the existing layout, choosing the
-	// window that keeps the remaining free space most contiguous (see
-	// chooseOrderedWindow); warm positions only break ties.
+	// Zero-disruption path: place into the existing layout. Warm positions
+	// win; among equally warm windows, the one keeping the remaining free
+	// space most contiguous (see chooseOrderedWindow).
 	free := computeFreeIntervals(a.bound, a.chainSize)
 	if starts := requestStartCandidates(free, req.size, req.preferredPositions); len(starts) > 0 {
 		best, _ := chooseOrderedWindow(free, req.size, 0, a.chainSize, starts, func(start int) int {
@@ -279,17 +279,16 @@ func requestStartCandidates(free []interval, size int, preferred []int) []int {
 }
 
 // chooseOrderedWindow picks, among candidate starts of a need-wide window,
-// the one that leaves the chain's free space most usable. free lists every
+// where to place a workload that fits without evictions. free lists every
 // free run in [lo, hi), sorted, including runs too short for this request.
 // Candidates are compared by, in order:
 //
-//  1. the longest free run left behind (longer is better): a single-node
+//  1. warmth, the number of the workload's previous positions covered:
+//     node-local weights and compile caches make a return cheap;
+//  2. the longest free run left behind (longer is better): a single-node
 //     workload goes into the tightest hole, not into the middle of the only
 //     run a multi-node job could use;
-//  2. the number of free runs left behind (fewer is better);
-//  3. warmth, the number of the workload's previous positions covered:
-//     node-local weights and compile caches make a return cheap, but only
-//     among windows that leave the free space equally usable;
+//  3. the number of free runs left behind (fewer is better);
 //  4. whether the window touches a chain end (lo or hi): a workload at an
 //     end never separates free space that later coalesces around it;
 //  5. the smallest start, for determinism.
@@ -326,14 +325,14 @@ func chooseOrderedWindow(free []interval, need, lo, hi int, candidates []int, wa
 		return sc, fits
 	}
 	better := func(a, b score) bool {
+		if a.warm != b.warm {
+			return a.warm > b.warm
+		}
 		if a.longest != b.longest {
 			return a.longest > b.longest
 		}
 		if a.runs != b.runs {
 			return a.runs < b.runs
-		}
-		if a.warm != b.warm {
-			return a.warm > b.warm
 		}
 		return a.atEnd && !b.atEnd
 	}

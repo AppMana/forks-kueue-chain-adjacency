@@ -671,14 +671,11 @@ func TestOrderedDispatch_AdmissionWarmthPrefersLastKnownRun(t *testing.T) {
 	for i := 0; i < chainSize; i++ {
 		nodes[i] = makeOrderedChainNode(chainName, i, "1")
 	}
-	// Occupy indices 4, 5, 10 and 11 so two disjoint four-wide free runs
-	// exist: {0..3} and {6..9}. Every corner of either run leaves the same
-	// free shape, so warmth decides; it never splits a longer free run.
+	// Occupy indices 4 and 5 so two disjoint free runs exist: {0..3} and
+	// {6..11}. Both fit a 2-slice request.
 	pods := []*corev1.Pod{
 		occupyOrderedChainHost("h4", "1"),
 		occupyOrderedChainHost("h5", "1"),
-		occupyOrderedChainHost("h10", "1"),
-		occupyOrderedChainHost("h11", "1"),
 	}
 
 	initialObjects := make([]client.Object, 0, len(nodes)+len(pods))

@@ -620,8 +620,9 @@ func (s *TASFlavorSnapshot) pickOrderedContiguousRun(
 	// Scan the maximal free label-adjacent runs and collect candidate
 	// windows: each run's leftmost and rightmost window, plus a warm
 	// anchor starting at the smallest preferred position inside the run.
-	// chooseOrderedWindow then picks the window that keeps the remaining
-	// free space most contiguous, with warmth as a tiebreak. Positions here
+	// chooseOrderedWindow then picks the warmest window, and among equally
+	// warm ones the window keeping the remaining free space most
+	// contiguous. Positions here
 	// are indices into sortedChildren; a label gap splits runs.
 	windowOverlap := func(startIdx int) int {
 		if len(preferredPositions) == 0 {

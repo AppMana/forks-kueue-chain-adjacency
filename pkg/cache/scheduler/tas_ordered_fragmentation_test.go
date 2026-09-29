@@ -22,12 +22,12 @@ import (
 	"testing"
 )
 
-// The zero-disruption placement keeps the chain's free space contiguous:
-// among the feasible windows it prefers the one leaving the longest free run,
-// then the fewest free runs, then the workload's warm positions, then a window
-// touching a chain end. A single-node workload returning to a warm
-// node in the middle of the chain otherwise strands the free cells on both
-// sides of it, and a two-node job waits although enough nodes are idle.
+// Zero-disruption placement on an ordered level. A workload returns to its
+// warm nodes when it can; otherwise, and among equally warm windows, it takes
+// the window leaving the longest free run, then the fewest free runs, then a
+// window touching a chain end, then the leftmost. A single-node workload with
+// no warm nodes therefore goes into the tightest gap or to a chain end, never
+// into the middle of the only run a multi-node job could use.
 
 // liveChain is the Thunderbolt chain as observed on 2026-09-29: 018(0) 027(1)
 // 019(2) 008(3) 020(4) 009(5) 025(6) 023(7) 022(8) 021(9) 004(10) 002(11).
@@ -64,7 +64,7 @@ func renderChain(chainSize int, bound []orderedAllocation, extra map[int]string)
 	return strings.Join(out, " ")
 }
 
-func TestOrderedAllocator_SingleNodeReturnsToChainEndNotWarmMiddle(t *testing.T) {
+func TestOrderedAllocator_ColdSingleNodeGoesToChainEndNotMiddle(t *testing.T) {
 	cases := map[string]struct {
 		runtimeOn025  bool
 		wantPlacement int
@@ -72,27 +72,27 @@ func TestOrderedAllocator_SingleNodeReturnsToChainEndNotWarmMiddle(t *testing.T)
 		// when it must wait.
 		wantTwoNode int
 	}{
-		// Every free cell is an isolated hole, so no window leaves the free
-		// space more usable; the warm node wins and the two-node job waits
-		// until 025 is freed.
-		"Unity runtime still holds 025": {runtimeOn025: true, wantPlacement: 5, wantTwoNode: -1},
-		"Unity runtime moved off 025":   {runtimeOn025: false, wantPlacement: 11, wantTwoNode: 5},
+		// Every free cell is an isolated hole; the chain end wins.
+		"Unity runtime still holds 025": {runtimeOn025: true, wantPlacement: 11, wantTwoNode: -1},
+		// 009+025 is the only two-wide run; the single node stays out of it.
+		"Unity runtime moved off 025": {runtimeOn025: false, wantPlacement: 11, wantTwoNode: 5},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
 			bound := liveChain(c.runtimeOn025)
-			t.Logf("before: %s", renderChain(12, bound, map[int]string{5: "qwen38"}))
+			t.Logf("before: %s", renderChain(12, bound, nil))
 			a := &orderedAllocator{chainSize: 12, bound: bound}
-			// The Qwen3.8 server re-admitted by its rollout, warm on 009.
-			plan := a.schedule(orderedRequest{size: 1, preferredPositions: []int{5}}, orderedBudgetNoCompact)
+			// A single-node workload with no warm nodes, e.g. the Qwen3.8
+			// server started fresh after being scaled to zero.
+			plan := a.schedule(orderedRequest{size: 1}, orderedBudgetNoCompact)
 			if plan.pending {
 				t.Fatalf("unexpected pending: %s", plan.pendingReason)
 			}
 			if plan.placement != c.wantPlacement {
-				t.Errorf("qwen38 placement = %d, want %d", plan.placement, c.wantPlacement)
+				t.Errorf("placement = %d, want %d", plan.placement, c.wantPlacement)
 			}
 			after := append(append([]orderedAllocation{}, bound...),
-				orderedAllocation{id: "qwen38", start: plan.placement, size: 1})
+				orderedAllocation{id: "single", start: plan.placement, size: 1})
 			t.Logf("after:  %s", renderChain(12, after, nil))
 
 			next := (&orderedAllocator{chainSize: 12, bound: after}).schedule(orderedRequest{size: 2}, orderedBudgetNoCompact)
@@ -107,6 +107,18 @@ func TestOrderedAllocator_SingleNodeReturnsToChainEndNotWarmMiddle(t *testing.T)
 			}
 		})
 	}
+}
+
+func TestOrderedAllocator_WarmNodesWinOverContiguity(t *testing.T) {
+	// Qwen3.8 warm on 009 returns there even though that splits the only
+	// two-wide free run: warm weights are the first criterion.
+	runSchedulerTestCase(t, schedulerTestCase{
+		chainSize:     12,
+		bound:         liveChain(false),
+		req:           orderedRequest{size: 1, preferredPositions: []int{5}},
+		budget:        orderedBudgetNoCompact,
+		wantPlacement: 5,
+	})
 }
 
 func TestOrderedAllocator_BestFitKeepsTheLargestFreeRun(t *testing.T) {
@@ -130,32 +142,59 @@ func TestOrderedAllocator_BestFitKeepsTheLargestFreeRun(t *testing.T) {
 	})
 }
 
-func TestOrderedAllocator_WarmthStillBreaksFragmentationTies(t *testing.T) {
-	// Free {0..3} and {8..11}, both four wide. A two-node workload warm on
-	// {8,9} returns there: every corner leaves the same free shape.
+func TestOrderedAllocator_FragmentationBreaksWarmthTies(t *testing.T) {
+	// A three-wide request warm on {0,1}: windows starting at 0 and at 1 are
+	// both two cells warm. Starting at 0 keeps the free space in one run.
 	runSchedulerTestCase(t, schedulerTestCase{
 		chainSize:     12,
-		bound:         []orderedAllocation{allocPinned("B", 4, 4)},
-		req:           orderedRequest{size: 2, preferredPositions: []int{8, 9}},
+		bound:         []orderedAllocation{allocPinned("B", 5, 7)},
+		req:           orderedRequest{size: 3, preferredPositions: []int{0, 1}},
 		budget:        orderedBudgetNoCompact,
-		wantPlacement: 8,
+		wantPlacement: 0,
+	})
+	// Free {1..3} and {9..11}: every corner leaves a three-wide run and two
+	// runs in all. The window at the chain end wins over the leftmost one.
+	runSchedulerTestCase(t, schedulerTestCase{
+		chainSize:     12,
+		bound:         []orderedAllocation{allocPinned("A", 0, 1), allocPinned("B", 4, 5)},
+		req:           orderedRequest{size: 1},
+		budget:        orderedBudgetNoCompact,
+		wantPlacement: 11,
+	})
+	// A cold single node takes the tightest gap: free {0,1} and {4..11}.
+	runSchedulerTestCase(t, schedulerTestCase{
+		chainSize:     12,
+		bound:         []orderedAllocation{allocPinned("B", 2, 2)},
+		req:           orderedRequest{size: 1},
+		budget:        orderedBudgetNoCompact,
+		wantPlacement: 0,
 	})
 }
 
 func TestPickOrderedContiguousRun_KeepsFreeSpaceContiguous(t *testing.T) {
 	// sliceState 1 = free chain node. Live chain with 025 freed and 009
-	// vacated by the Qwen3.8 rollout: free {2}, {5,6}, {11}.
+	// vacated: free {2}, {5,6}, {11}.
 	states := []int32{0, 0, 1, 0, 0, 1, 1, 0, 0, 0, 0, 1}
-	domains := make([]*domain, len(states))
-	for i, st := range states {
-		domains[i] = &domain{levelValues: []string{"primary", strconv.Itoa(i)}, sliceState: st, state: st}
+	domains := func() []*domain {
+		out := make([]*domain, len(states))
+		for i, st := range states {
+			out[i] = &domain{levelValues: []string{"primary", strconv.Itoa(i)}, sliceState: st, state: st}
+		}
+		return out
 	}
 	s := &TASFlavorSnapshot{}
-	got := s.pickOrderedContiguousRun(domains, 1, 0, 1, []int{5})
-	if got == nil {
-		t.Fatal("expected a pick")
+	start := func(preferred []int) int {
+		got := s.pickOrderedContiguousRun(domains(), 1, 0, 1, preferred)
+		if got == nil {
+			t.Fatal("expected a pick")
+		}
+		n, _ := strconv.Atoi(got[0].levelValues[1])
+		return n
 	}
-	if start, _ := strconv.Atoi(got[0].levelValues[1]); start != 11 {
-		t.Errorf("start = %d, want 11 (chain end; 009 would split the only two-wide run)", start)
+	if got := start(nil); got != 11 {
+		t.Errorf("cold single node start = %d, want 11 (chain end; 009 would split the only two-wide run)", got)
+	}
+	if got := start([]int{5}); got != 5 {
+		t.Errorf("warm single node start = %d, want 5 (its warm node)", got)
 	}
 }

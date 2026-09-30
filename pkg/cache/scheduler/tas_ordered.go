@@ -152,6 +152,51 @@ type orderedAllocator struct {
 	// allocator falls back to defaultVictimLess (priority asc, boundAt desc
 	// to protect older workloads, id asc for determinism).
 	victimLess victimComparator
+	// excluded optionally reports that a run of the given size must not
+	// cover the position (see orderedMaxRunSizeLabel). It applies to the
+	// request and to every relocated victim, each with its own size. nil
+	// excludes nothing.
+	excluded func(pos, size int) bool
+}
+
+// freeFor returns the free intervals a run of the given size may use:
+// positions held by bound are taken, and so are positions excluded for runs
+// of that size.
+func (a *orderedAllocator) freeFor(bound []orderedAllocation, size int) []interval {
+	return splitExcluded(computeFreeIntervals(bound, a.chainSize), size, a.excluded)
+}
+
+// splitExcluded removes, from each interval, the positions excluded for runs
+// of the given size. It returns the resulting sub-intervals, sorted, and for
+// each the index of the interval it came from.
+func splitExcluded(ivs []interval, size int, excluded func(pos, size int) bool) []interval {
+	sub, _ := splitExcludedWithParents(ivs, size, excluded)
+	return sub
+}
+
+func splitExcludedWithParents(ivs []interval, size int, excluded func(pos, size int) bool) ([]interval, []int) {
+	parents := make([]int, 0, len(ivs))
+	if excluded == nil {
+		for i := range ivs {
+			parents = append(parents, i)
+		}
+		return ivs, parents
+	}
+	out := make([]interval, 0, len(ivs))
+	for i, iv := range ivs {
+		start := iv.start
+		for p := iv.start; p <= iv.end; p++ {
+			if p < iv.end && !excluded(p, size) {
+				continue
+			}
+			if p > start {
+				out = append(out, interval{start: start, end: p})
+				parents = append(parents, i)
+			}
+			start = p + 1
+		}
+	}
+	return out, parents
 }
 
 const (
@@ -194,7 +239,7 @@ func (a *orderedAllocator) schedule(req orderedRequest, budget int) orderedPlan 
 	// Zero-disruption path: place into the existing layout. Warm positions
 	// win; among equally warm windows, the one keeping the remaining free
 	// space most contiguous (see chooseOrderedWindow).
-	free := computeFreeIntervals(a.bound, a.chainSize)
+	free := a.freeFor(a.bound, req.size)
 	if starts := requestStartCandidates(free, req.size, req.preferredPositions); len(starts) > 0 {
 		best, _ := chooseOrderedWindow(free, req.size, 0, a.chainSize, starts, func(start int) int {
 			return overlapWithRun(req.preferredPositions, start, req.size)
@@ -434,7 +479,7 @@ func (a *orderedAllocator) solveWithCompaction(req orderedRequest, budget int) o
 		staying = append(staying, pinned...)
 		staying = append(staying, keepEvictables...)
 
-		for _, plan := range tryPlansWithEvictions(req, evictSet, staying, byID, a.chainSize) {
+		for _, plan := range tryPlansWithEvictions(req, evictSet, staying, byID, a.chainSize, a.excluded) {
 			// Effective eviction count must still respect the budget after
 			// no-op moves are filtered out (a relocation that leaves an
 			// allocation contiguous at its current start is not a real
@@ -482,8 +527,9 @@ func tryPlansWithEvictions(
 	evictSet, staying []orderedAllocation,
 	byID map[string]orderedAllocation,
 	chainSize int,
+	excluded func(pos, size int) bool,
 ) []orderedPlan {
-	freeForRequest := computeFreeIntervals(staying, chainSize)
+	freeForRequest := splitExcluded(computeFreeIntervals(staying, chainSize), req.size, excluded)
 	starts := requestStartCandidates(freeForRequest, req.size, req.preferredPositions)
 	var plans []orderedPlan
 	for _, start := range starts {
@@ -495,7 +541,7 @@ func tryPlansWithEvictions(
 			size:  req.size,
 		})
 		free := computeFreeIntervals(occupied, chainSize)
-		relocs, ok := placeEvictedWarm(evictSet, free)
+		relocs, ok := placeEvictedWarm(evictSet, free, excluded)
 		if !ok {
 			continue
 		}
@@ -574,8 +620,9 @@ type relocation struct {
 // falls back to plain leftmost first-fit-decreasing, so warmth never costs
 // feasibility. The outer solver enumerates eviction subsets exhaustively,
 // so even when both passes fail on a particular subset, another subset
-// choice may succeed.
-func placeEvictedWarm(allocs []orderedAllocation, free []interval) ([]relocation, bool) {
+// choice may succeed. Positions excluded for an allocation's size are never
+// part of its new run.
+func placeEvictedWarm(allocs []orderedAllocation, free []interval, excluded func(pos, size int) bool) ([]relocation, bool) {
 	if len(allocs) == 0 {
 		return nil, true
 	}
@@ -590,10 +637,10 @@ func placeEvictedWarm(allocs []orderedAllocation, free []interval) ([]relocation
 		}
 		return sorted[i].id < sorted[j].id
 	})
-	if result, ok := placeWithSelector(sorted, free, warmPlacement); ok {
+	if result, ok := placeWithSelector(sorted, free, warmPlacement, excluded); ok {
 		return result, true
 	}
-	return placeWithSelector(sorted, free, leftmostPlacement)
+	return placeWithSelector(sorted, free, leftmostPlacement, excluded)
 }
 
 // placementSelector picks (interval index, offset) for one allocation from
@@ -642,17 +689,20 @@ func warmPlacement(a orderedAllocation, remaining []interval) (int, int, bool) {
 }
 
 // placeWithSelector runs the placement loop with the given selector,
-// splitting intervals around mid-interval placements.
-func placeWithSelector(sorted []orderedAllocation, free []interval, pick placementSelector) ([]relocation, bool) {
+// splitting intervals around mid-interval placements. The selector only sees
+// the parts of the remaining intervals not excluded for the allocation's size.
+func placeWithSelector(sorted []orderedAllocation, free []interval, pick placementSelector, excluded func(pos, size int) bool) ([]relocation, bool) {
 	remaining := make([]interval, len(free))
 	copy(remaining, free)
 	result := make([]relocation, 0, len(sorted))
 	for _, a := range sorted {
-		idx, offset, ok := pick(a, remaining)
+		usable, parents := splitExcludedWithParents(remaining, a.size, excluded)
+		subIdx, offset, ok := pick(a, usable)
 		if !ok {
 			return nil, false
 		}
 		result = append(result, relocation{id: a.id, newStart: offset})
+		idx := parents[subIdx]
 		iv := remaining[idx]
 		next := make([]interval, 0, len(remaining)+1)
 		next = append(next, remaining[:idx]...)

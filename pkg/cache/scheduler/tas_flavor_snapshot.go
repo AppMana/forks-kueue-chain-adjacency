@@ -105,6 +105,112 @@ type leafDomain struct {
 
 	// node at the leaf, if the lowest level is a node
 	node *nodeInfo
+
+	// orderedMaxRunSize is the smallest orderedMaxRunSizeLabel value among
+	// the leaf's nodes; 0 when none carries the label.
+	orderedMaxRunSize int
+}
+
+// orderedMaxRunSizeLabel marks a node that joins a contiguous run on an
+// ordered level only when the run is at most this many positions long: for
+// example a node at the end of a chain that reaches its neighbours over a
+// slower link than the rest of the chain. Two such nodes still serve a
+// two-position workload, while a longer pipeline stays on the fast stretch.
+// A run longer than every stretch of the chain free of positions restricted
+// for its length may still use them: otherwise a workload spanning the whole
+// chain could never be placed.
+const orderedMaxRunSizeLabel = "kueue.x-k8s.io/tas-ordered-max-run-size"
+
+// parseOrderedMaxRunSize returns the node's orderedMaxRunSizeLabel value, or
+// 0 when the label is absent or not a positive integer.
+func parseOrderedMaxRunSize(labels map[string]string) int {
+	v, ok := labels[orderedMaxRunSizeLabel]
+	if !ok {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
+}
+
+// minOrderedMaxRunSize combines two orderedMaxRunSize values, where 0 means
+// unrestricted.
+func minOrderedMaxRunSize(a, b int) int {
+	switch {
+	case a == 0:
+		return b
+	case b == 0:
+		return a
+	default:
+		return min(a, b)
+	}
+}
+
+// domainOrderedMaxRunSize returns the tightest orderedMaxRunSizeLabel value
+// among the nodes beneath the domain; 0 when none is restricted.
+func (s *TASFlavorSnapshot) domainOrderedMaxRunSize(d *domain) int {
+	if leaf, ok := s.leaves[d.id]; ok && &leaf.domain == d {
+		return leaf.orderedMaxRunSize
+	}
+	out := 0
+	for _, c := range d.children {
+		out = minOrderedMaxRunSize(out, s.domainOrderedMaxRunSize(c))
+	}
+	return out
+}
+
+// orderedRunExclusion reports, for the given ordered-level domains, whether a
+// run of the given length must not cover the chain position with the given
+// label value. A position is excluded when its nodes carry
+// orderedMaxRunSizeLabel below the run length and the chain has a stretch of
+// positions, in label space between the smallest and largest label, at least
+// that long without such restrictions. Returns nil when no domain is
+// restricted.
+func (s *TASFlavorSnapshot) orderedRunExclusion(orderedDomains []*domain) func(label, size int) bool {
+	maxRun := make(map[int]int)
+	lo, hi, seen := 0, 0, false
+	for _, d := range orderedDomains {
+		n, err := strconv.Atoi(d.levelValues[len(d.levelValues)-1])
+		if err != nil {
+			continue
+		}
+		if !seen {
+			lo, hi, seen = n, n, true
+		}
+		lo, hi = min(lo, n), max(hi, n)
+		if r := s.domainOrderedMaxRunSize(d); r > 0 {
+			maxRun[n] = r
+		}
+	}
+	if len(maxRun) == 0 {
+		return nil
+	}
+	restricted := func(label, size int) bool {
+		r := maxRun[label]
+		return r > 0 && size > r
+	}
+	longest := make(map[int]int)
+	longestStretch := func(size int) int {
+		if v, ok := longest[size]; ok {
+			return v
+		}
+		best, run := 0, 0
+		for l := lo; l <= hi; l++ {
+			if restricted(l, size) {
+				run = 0
+				continue
+			}
+			run++
+			best = max(best, run)
+		}
+		longest[size] = best
+		return best
+	}
+	return func(label, size int) bool {
+		return restricted(label, size) && size <= longestStretch(size)
+	}
 }
 
 type domainByID map[utiltas.TopologyDomainID]*domain
@@ -417,6 +523,11 @@ func (s *TASFlavorSnapshot) findCompactionPlan(
 		chainSize: chainSize,
 		bound:     bound,
 	}
+	if excluded := s.orderedRunExclusion(orderedDomains); excluded != nil {
+		allocator.excluded = func(pos, size int) bool {
+			return excluded(pos+minLabel, size)
+		}
+	}
 	s.log.V(2).Info("findCompactionPlan input",
 		"chainSize", chainSize,
 		"minLabel", minLabel,
@@ -658,8 +769,9 @@ func (s *TASFlavorSnapshot) pickOrderedContiguousRun(
 		}
 		runStart = -1
 	}
+	excluded := s.orderedRunExclusion(sortedChildren)
 	for i, child := range sortedChildren {
-		isFree := child.sliceState >= 1
+		isFree := child.sliceState >= 1 && (excluded == nil || !parsed[i] || !excluded(labels[i], need))
 		if isFree && runStart >= 0 && !labelAdjacent(i) {
 			flushRun(i)
 		}
@@ -754,6 +866,8 @@ func (s *TASFlavorSnapshot) addNode(node *nodeInfo) utiltas.TopologyDomainID {
 		}
 		s.leaves[domainID] = &leafDomain
 	}
+	leaf := s.leaves[domainID]
+	leaf.orderedMaxRunSize = minOrderedMaxRunSize(leaf.orderedMaxRunSize, parseOrderedMaxRunSize(node.Labels))
 	capacity := resources.NewRequests(node.Allocatable)
 	s.addCapacity(domainID, capacity)
 	return domainID

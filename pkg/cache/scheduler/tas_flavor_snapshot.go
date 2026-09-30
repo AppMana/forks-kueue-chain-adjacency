@@ -1281,6 +1281,17 @@ func (s *TASFlavorSnapshot) findReplacementAssignment(
 	wl *kueue.Workload,
 	assumedUsage map[utiltas.TopologyDomainID]resources.Requests,
 ) (*utiltas.TopologyAssignment, *utiltas.TopologyAssignment, string) {
+	// On an ordered level every pod is a rank bound to its chain position:
+	// a single replacement node cannot sit next to both of the unhealthy
+	// node's neighbours, so the healthy ranks would be split across a gap.
+	// Fail instead; fail-fast eviction requeues the workload and ordered
+	// placement re-places it as one contiguous run, or keeps it pending
+	// until one exists.
+	if s.slicesOnOrderedLevel(tr.PodSet.TopologyRequest) {
+		return nil, nil, fmt.Sprintf(
+			"cannot replace unhealthy node %s in place: the podset's slices are bound to positions on an ordered level; "+
+				"the workload must be re-placed as one contiguous run", wl.Status.UnhealthyNodes[0].Name)
+	}
 	tr.Count = deleteDomain(existingAssignment, wl.Status.UnhealthyNodes[0].Name)
 	if isStale, staleDomain := s.IsTopologyAssignmentStale(existingAssignment); isStale {
 		return nil, nil, fmt.Sprintf("Cannot replace the node, because the existing topologyAssignment is invalid, as it contains the stale domain %v", staleDomain)
@@ -1319,6 +1330,30 @@ func (s *TASFlavorSnapshot) findReplacementAssignment(
 	}
 	newAssignment := s.mergeTopologyAssignments(replacementAssignment[tr.PodSet.Name], existingAssignment)
 	return newAssignment, replacementAssignment[tr.PodSet.Name], ""
+}
+
+// slicesOnOrderedLevel reports whether a podset's slices are placed at an
+// ordered topology level, where slice positions form a chain.
+func (s *TASFlavorSnapshot) slicesOnOrderedLevel(req *kueue.PodSetTopologyRequest) bool {
+	if req == nil || !s.hasOrderedLevels() {
+		return false
+	}
+	ordered := func(levelKey *string) bool {
+		if levelKey == nil {
+			return false
+		}
+		idx, ok := s.resolveLevelIdx(*levelKey)
+		return ok && s.isOrderedLevel(idx)
+	}
+	if ordered(req.PodSetSliceRequiredTopology) {
+		return true
+	}
+	for i := range req.PodsetSliceRequiredTopologyConstraints {
+		if ordered(&req.PodsetSliceRequiredTopologyConstraints[i].Topology) {
+			return true
+		}
+	}
+	return false
 }
 
 func addAssumedUsage(assumedUsage map[utiltas.TopologyDomainID]resources.Requests, ta *utiltas.TopologyAssignment, tr *TASPodSetRequests) {

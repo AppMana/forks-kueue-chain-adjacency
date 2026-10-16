@@ -87,6 +87,9 @@ type Scheduler struct {
 	clock                   clock.Clock
 	roleTracker             *roletracker.RoleTracker
 	customLabels            *metrics.CustomLabels
+	// preemptionExpectations is shared with the preemptor and the queue
+	// manager; TAS compaction records its in-flight evictions in it too.
+	preemptionExpectations *expectations.Store
 
 	// schedulingCycle identifies the number of scheduling
 	// attempts since the last restart.
@@ -198,6 +201,7 @@ func New(queues *qcache.Manager, cache *schdcache.Cache, cl client.Client, recor
 		admissionFairSharing:    options.admissionFairSharing,
 		quotaCheckStrategy:      options.quotaCheckStrategy,
 		roleTracker:             options.roleTracker,
+		preemptionExpectations:  options.preemptionExpectations,
 		customLabels:            options.customLabels,
 	}
 	return s
@@ -511,6 +515,12 @@ func (s *Scheduler) resolveTASCompactionTargets(log logr.Logger, snapshot *schdc
 // This is the operational arm of the compacting-GC primitive at the
 // snapshot level — the snapshot computed which workloads to relocate;
 // this function actually issues the evictions.
+//
+// The pending workload is requeued immediately and re-plans every cycle
+// against a snapshot that keeps the victim bound until its pods stop, so the
+// same plan names the same victim again. Like IssuePreemptions, an eviction
+// is issued once: a victim already Evicted, or evicted by an earlier cycle
+// whose update the cache has not observed yet, is counted as pending.
 func (s *Scheduler) issueTASCompaction(ctx context.Context, log logr.Logger, e *entry, snapshot *schdcache.Snapshot) {
 	evicted := 0
 	failed := 0
@@ -521,6 +531,21 @@ func (s *Scheduler) issueTASCompaction(ctx context.Context, log logr.Logger, e *
 				"victim", ref)
 			continue
 		}
+		victimKey := types.NamespacedName{Name: victim.Obj.Name, Namespace: victim.Obj.Namespace}
+		if workload.IsEvicted(victim.Obj) {
+			log.V(3).Info("TAS compaction eviction ongoing",
+				"victim", klog.KObj(victim.Obj), "evictor", klog.KObj(e.Obj))
+			s.preemptionExpectations.ObservedUID(log, victimKey, victim.Obj.UID)
+			evicted++
+			continue
+		}
+		if !s.preemptionExpectations.Satisfied(log, victimKey) {
+			log.V(3).Info("TAS compaction eviction already issued, waiting for observation",
+				"victim", klog.KObj(victim.Obj), "evictor", klog.KObj(e.Obj))
+			evicted++
+			continue
+		}
+		s.preemptionExpectations.ExpectUIDs(log, victimKey, []types.UID{victim.Obj.UID})
 		wlCopy := victim.Obj.DeepCopy()
 		exposeLqMetrics := s.cache.ShouldExposeLocalQueueMetricsForWorkload(log, wlCopy)
 		message := fmt.Sprintf(
@@ -535,6 +560,7 @@ func (s *Scheduler) issueTASCompaction(ctx context.Context, log logr.Logger, e *
 			workload.EvictWithLooseOnApply(), workload.EvictWithRetryOnConflictForPatch(),
 		)
 		if err != nil {
+			s.preemptionExpectations.ObservedUID(log, victimKey, victim.Obj.UID)
 			failed++
 			log.Error(err, "Failed to evict TAS compaction victim", "victim", klog.KObj(wlCopy))
 			continue

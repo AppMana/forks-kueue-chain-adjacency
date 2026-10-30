@@ -139,6 +139,16 @@ func (c *candidateIterator) candidateIsValid(candidate *candidateElem, borrow bo
 	if borrow && candidate.preemptionVariant == ReclaimWithoutBorrowing {
 		return false
 	}
+	if c.hierarchicalReclaimCtx.HasTASRequests {
+		// When the preemptor requires a specific TAS placement (e.g. a contiguous
+		// run on an Ordered topology level), earlier candidates tentatively removed
+		// from cq during the forward scan may sit on domains that do not open the
+		// run. Allow scanning remaining candidates in cq so fillBackWorkloads can
+		// restore the earlier ones and keep only the topological blockers; the
+		// caller verifies that the final target set after fillBackWorkloads does
+		// not reclaim past cq's nominal quota.
+		return true
+	}
 	cq := c.snapshot.ClusterQueue(candidate.wl.ClusterQueue)
 	if schdcache.IsWithinNominalInResources(cq, c.frsNeedPreemption) {
 		return false

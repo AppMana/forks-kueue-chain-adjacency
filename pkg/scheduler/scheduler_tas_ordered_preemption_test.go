@@ -381,3 +381,323 @@ func TestScheduleForTASOrderedPriorityPreemption(t *testing.T) {
 		})
 	}
 }
+
+// TestScheduleForTASOrderedDualQueueEvalReservation models the dual-queue
+// cohort on appmana-cluster-03 (kubernetes-sigs/kueue#1603):
+//   - tb-chain (training): nominalQuota=11 pods / 264 GPUs, borrowingLimit=0,
+//     reclaimWithinCohort=LowerPriority.
+//   - tb-chain-eval (evaluations): nominalQuota=1 pod / 24 GPUs, unlimited
+//     borrowing from tb-chain.
+//
+// It verifies two invariants:
+//  1. When tb-chain-eval borrows 3 positions above its 1-pod nominal quota
+//     (4 evals total) and the only eval blocking a pending 2-node trainer's
+//     contiguous run ([3, 4]) is the OLDEST eval (so 3 younger evals on [6],
+//     [10], [11] are visited first by the candidate iterator), preemption
+//     still reaches the blocker on [3] and fillBackWorkloads restores the 3
+//     younger evals so only [3] is evicted.
+//  2. When tb-chain is using all 11 of its nominal positions and tb-chain-eval
+//     is using its 1 reserved nominal position (index 11), a pending trainer
+//     in tb-chain never preempts or borrows the reserved eval node.
+func TestScheduleForTASOrderedDualQueueEvalReservation(t *testing.T) {
+	const (
+		chainName  = "appmana.com/tb-chain-name"
+		chainIndex = "appmana.com/tb-chain-index"
+		maxRunSize = "kueue.x-k8s.io/tas-ordered-max-run-size"
+		evictable  = "kueue.x-k8s.io/tas-ordered-evictable"
+		gpu        = corev1.ResourceName("nvidia.com/gpu")
+		ns         = "spellsource"
+		pending    = "krea2-edit-sil-wb-s8-c512"
+	)
+	hostAt := map[int]string{
+		0: "appmana-018", 1: "appmana-027", 2: "appmana-019", 3: "appmana-008",
+		4: "appmana-020", 5: "appmana-009", 6: "appmana-025", 7: "appmana-023",
+		8: "appmana-022", 9: "appmana-021", 10: "appmana-004", 11: "appmana-002",
+	}
+	type occupant struct {
+		name string
+		idxs []int
+		age  time.Duration
+	}
+	cases := map[string]struct {
+		trainers    []occupant
+		evals       []occupant
+		wantEvicted []string
+		wantHosts   []string
+	}{
+		"reclaims only the oldest borrowed eval blocking [3, 4] and keeps the 3 younger evals": {
+			trainers: []occupant{
+				{"krea2-s8-c512-cv2-written", []int{0, 1}, 48 * time.Hour},
+				{"iris-s16-c1024", []int{2}, 48 * time.Hour},
+				{"qwen21-s8-c512-cv2-ta-written", []int{5}, 48 * time.Hour},
+				{"iris-s16-c1024-fft", []int{7, 8, 9}, 48 * time.Hour},
+			},
+			// ref-t2i-edit-trials on [3] is the OLDEST eval (90m), while [6], [10], [11]
+			// are younger (10m..30m) and visited first by CandidatesOrdering.
+			evals: []occupant{
+				{"ref-t2i-edit-trials", []int{3}, 90 * time.Minute},
+				{"final-eval-fibo2-edit-sil-fuschia", []int{6}, 30 * time.Minute},
+				{"final-eval-pixeldit", []int{10}, 20 * time.Minute},
+				{"final-eval-fibo2-edit-sil-wb", []int{11}, 10 * time.Minute},
+			},
+			wantEvicted: []string{"ref-t2i-edit-trials"},
+			wantHosts:   []string{hostAt[3], hostAt[4]},
+		},
+		"training at 11/11 nodes never preempts the 1 reserved eval node": {
+			trainers: []occupant{
+				{"fibo2-s16-c1024", []int{0, 1, 2, 3, 4}, 48 * time.Hour},
+				{"flux2-edit-photo-s8-c512", []int{5, 6, 7, 8, 9}, 24 * time.Hour},
+				{"qwen21-s8-c512-cv2-ta-written", []int{10}, 12 * time.Hour},
+			},
+			evals: []occupant{
+				{"final-eval-flux2-edit-sil-fuschia", []int{11}, 5 * time.Minute},
+			},
+			wantEvicted: nil,
+			wantHosts:   nil,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			now := time.Now().Truncate(time.Second)
+			topology := utiltestingapi.MakeTopology("tb-chain").
+				Levels(chainName, chainIndex, corev1.LabelHostname).
+				Obj()
+			topology.Spec.Levels[1].Ordered = true
+			rf := utiltestingapi.MakeResourceFlavor("tb-chain-primary").
+				NodeLabel(chainName, "primary").
+				TopologyName(topology.Name).
+				Obj()
+			cqTrain := utiltestingapi.MakeClusterQueue("tb-chain").
+				Cohort("tb-chain").
+				ResourceGroup(*utiltestingapi.MakeFlavorQuotas(rf.Name).
+					Resource(corev1.ResourceCPU, "704", "0").
+					Resource(corev1.ResourcePods, "11", "0").
+					Resource(gpu, "264", "0").
+					Obj()).
+				Preemption(kueue.ClusterQueuePreemption{
+					WithinClusterQueue:            kueue.PreemptionPolicyLowerPriority,
+					ReclaimWithinCohort:           kueue.PreemptionPolicyLowerPriority,
+					BorrowWithinCohort:            &kueue.BorrowWithinCohort{Policy: kueue.BorrowWithinCohortPolicyNever},
+					MaxEvictionsPerSchedulingPass: ptr.To[int32](1),
+				}).
+				Obj()
+			cqEval := utiltestingapi.MakeClusterQueue("tb-chain-eval").
+				Cohort("tb-chain").
+				ResourceGroup(*utiltestingapi.MakeFlavorQuotas(rf.Name).
+					Resource(corev1.ResourceCPU, "64").
+					Resource(corev1.ResourcePods, "1").
+					Resource(gpu, "24").
+					Obj()).
+				Preemption(kueue.ClusterQueuePreemption{
+					WithinClusterQueue:            kueue.PreemptionPolicyLowerPriority,
+					ReclaimWithinCohort:           kueue.PreemptionPolicyAny,
+					MaxEvictionsPerSchedulingPass: ptr.To[int32](1),
+				}).
+				Obj()
+			lqTrain := utiltestingapi.MakeLocalQueue("tb-chain", ns).ClusterQueue(cqTrain.Name).Obj()
+			lqEval := utiltestingapi.MakeLocalQueue("tb-chain-eval", ns).ClusterQueue(cqEval.Name).Obj()
+
+			nodes := make([]corev1.Node, 0, len(hostAt))
+			for idx := range 12 {
+				n := testingnode.MakeNode(hostAt[idx]).
+					Label(chainName, "primary").
+					Label(chainIndex, strconv.Itoa(idx)).
+					Label(corev1.LabelHostname, hostAt[idx]).
+					StatusAllocatable(corev1.ResourceList{
+						corev1.ResourceCPU:  resource.MustParse("32"),
+						corev1.ResourcePods: resource.MustParse("110"),
+						gpu:                 resource.MustParse("24"),
+					}).
+					Ready()
+				if idx >= 10 {
+					n = n.Label(maxRunSize, "2")
+				}
+				nodes = append(nodes, *n.Obj())
+			}
+
+			podSet := func(count int32) *utiltestingapi.PodSetWrapper {
+				return utiltestingapi.MakePodSet("main", int(count)).
+					RequiredTopologyRequest(chainName).
+					SliceRequiredTopologyRequest(chainIndex).
+					SliceSizeTopologyRequest(1).
+					Request(corev1.ResourceCPU, "8").
+					Request(gpu, "24")
+			}
+			admitted := func(o occupant, lqName, cqName string, priority int32, canEvict bool) kueue.Workload {
+				at := now.Add(-o.age)
+				ta := utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname})
+				for _, idx := range o.idxs {
+					ta = ta.Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{hostAt[idx]}, 1).Obj())
+				}
+				count := int32(len(o.idxs))
+				ps := podSet(count)
+				if canEvict {
+					ps = ps.Annotations(map[string]string{evictable: "true"})
+				}
+				return *utiltestingapi.MakeWorkload(o.name, ns).
+					Queue(kueue.LocalQueueName(lqName)).
+					Priority(priority).
+					PodSets(*ps.Obj()).
+					ReserveQuotaAt(
+						utiltestingapi.MakeAdmission(kueue.ClusterQueueReference(cqName)).
+							PodSets(utiltestingapi.MakePodSetAssignment("main").
+								Assignment(corev1.ResourceCPU, kueue.ResourceFlavorReference(rf.Name), strconv.Itoa(8*int(count))).
+								Assignment(gpu, kueue.ResourceFlavorReference(rf.Name), strconv.Itoa(24*int(count))).
+								Assignment(corev1.ResourcePods, kueue.ResourceFlavorReference(rf.Name), strconv.Itoa(int(count))).
+								Count(count).
+								TopologyAssignment(ta.Obj()).
+								Obj()).
+							Obj(),
+						at,
+					).
+					AdmittedAt(true, at).
+					Obj()
+			}
+
+			var workloads []kueue.Workload
+			var running []string
+			for _, o := range tc.trainers {
+				workloads = append(workloads, admitted(o, lqTrain.Name, cqTrain.Name, 2000, false))
+				running = append(running, o.name)
+			}
+			for _, o := range tc.evals {
+				workloads = append(workloads, admitted(o, lqEval.Name, cqEval.Name, 1500, true))
+				running = append(running, o.name)
+			}
+			workloads = append(workloads, *utiltestingapi.MakeWorkload(pending, ns).
+				UID("pending-uid").
+				Queue(kueue.LocalQueueName(lqTrain.Name)).
+				Priority(2000).
+				PodSets(*podSet(2).
+					SubGroupCount(ptr.To[int32](2)).
+					SubGroupIndexLabel(ptr.To("jobset.sigs.k8s.io/job-index")).
+					PodIndexLabel(ptr.To("batch.kubernetes.io/job-completion-index")).
+					RequiredNodeSelectorRequirement(maxRunSize, corev1.NodeSelectorOpDoesNotExist).
+					Obj()).
+				Obj())
+
+			ctx, log := utiltesting.ContextWithLog(t)
+			clientBuilder := utiltesting.NewClientBuilder().
+				WithLists(
+					&kueue.WorkloadList{Items: workloads},
+					&corev1.NodeList{Items: nodes},
+				).
+				WithObjects(utiltesting.MakeNamespace(ns), topology, rf, cqTrain, cqEval, lqTrain, lqEval).
+				WithInterceptorFuncs(interceptor.Funcs{SubResourcePatch: utiltesting.TreatSSAAsStrategicMerge}).
+				WithStatusSubresource(&kueue.Workload{})
+			_ = tasindexer.SetupIndexes(ctx, utiltesting.AsIndexer(clientBuilder))
+			cl := clientBuilder.Build()
+			recorder := &utiltesting.EventRecorder{}
+			fakeClock := testingclock.NewFakeClock(now)
+			cqCache := schdcache.New(cl)
+			expectations := preemptexpectations.New()
+			qManager := qcache.NewManagerForUnitTests(cl, cqCache, qcache.WithClock(fakeClock), qcache.WithPreemptionExpectations(expectations))
+			for i := range nodes {
+				cqCache.TASCache().SyncNode(&nodes[i])
+			}
+			cqCache.AddOrUpdateResourceFlavor(log, rf.DeepCopy())
+			cqCache.AddOrUpdateTopology(log, topology.DeepCopy())
+			for _, cq := range []*kueue.ClusterQueue{cqTrain, cqEval} {
+				if err := cqCache.AddClusterQueue(ctx, cq.DeepCopy()); err != nil {
+					t.Fatalf("Inserting clusterQueue %s in cache: %v", cq.Name, err)
+				}
+				if err := qManager.AddClusterQueue(ctx, cq.DeepCopy()); err != nil {
+					t.Fatalf("Inserting clusterQueue %s in manager: %v", cq.Name, err)
+				}
+			}
+			for i := range workloads {
+				if workload.HasQuotaReservation(&workloads[i]) {
+					cqCache.AddOrUpdateWorkload(log, workloads[i].DeepCopy())
+				}
+			}
+			for _, lq := range []*kueue.LocalQueue{lqTrain, lqEval} {
+				if err := qManager.AddLocalQueue(ctx, lq.DeepCopy()); err != nil {
+					t.Fatalf("Inserting localQueue %s in manager: %v", lq.Name, err)
+				}
+			}
+
+			scheduler := New(qManager, cqCache, cl, recorder, WithClock(t, fakeClock), WithPreemptionExpectations(expectations))
+			wg := sync.WaitGroup{}
+			scheduler.setAdmissionRoutineWrapper(routine.NewWrapper(
+				func() { wg.Add(1) },
+				func() { wg.Done() },
+			))
+			ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			defer cancel()
+			go qManager.CleanUpOnContext(ctx)
+
+			get := func(name string) *kueue.Workload {
+				t.Helper()
+				var wl kueue.Workload
+				if err := cl.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, &wl); err != nil {
+					t.Fatalf("Getting workload %s: %v", name, err)
+				}
+				return &wl
+			}
+			evicted := func() []string {
+				t.Helper()
+				var out []string
+				for _, w := range running {
+					if workload.IsEvicted(get(w)) {
+						out = append(out, w)
+					}
+				}
+				slices.Sort(out)
+				return out
+			}
+			assignedHosts := func(name string) []string {
+				t.Helper()
+				wl := get(name)
+				if wl.Status.Admission == nil {
+					return nil
+				}
+				var out []string
+				for _, psa := range wl.Status.Admission.PodSetAssignments {
+					ta := utiltas.InternalFrom(psa.TopologyAssignment)
+					if ta == nil {
+						continue
+					}
+					for _, d := range ta.Domains {
+						out = append(out, d.Values[len(d.Values)-1])
+					}
+				}
+				slices.Sort(out)
+				return out
+			}
+			cycle := func() {
+				t.Helper()
+				scheduler.schedule(ctx)
+				wg.Wait()
+			}
+
+			cycle()
+			if got := evicted(); !slices.Equal(got, tc.wantEvicted) {
+				t.Fatalf("After the first cycle: evicted %v, want %v", got, tc.wantEvicted)
+			}
+			if len(tc.wantEvicted) == 0 {
+				if got := assignedHosts(pending); got != nil {
+					t.Errorf("%s admitted on %v, want pending", pending, got)
+				}
+				return
+			}
+			for _, victim := range tc.wantEvicted {
+				evictee := get(victim)
+				workload.UnsetQuotaReservationWithCondition(evictee, "Pending", "Evicted", fakeClock.Now())
+				if err := cl.Status().Update(ctx, evictee); err != nil {
+					t.Fatalf("Releasing quota of %s: %v", victim, err)
+				}
+				if err := cqCache.DeleteWorkload(log, workload.Key(evictee)); err != nil {
+					t.Fatalf("Removing %s from cache: %v", victim, err)
+				}
+				if err := qManager.AddOrUpdateWorkload(log, evictee.DeepCopy()); err != nil {
+					t.Fatalf("Requeueing %s: %v", victim, err)
+				}
+			}
+			cycle()
+			if got := assignedHosts(pending); !slices.Equal(got, tc.wantHosts) {
+				t.Errorf("%s placement: got %v, want %v", pending, got, tc.wantHosts)
+			}
+		})
+	}
+}

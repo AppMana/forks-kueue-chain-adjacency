@@ -281,6 +281,7 @@ func (p *Preemptor) classicalPreemptions(preemptionCtx *preemptionCtx) []*Target
 		FrsNeedPreemption: preemptionCtx.frsNeedPreemption,
 		Requests:          preemptionCtx.workloadUsage.Quota,
 		WorkloadOrdering:  p.workloadOrdering,
+		HasTASRequests:    len(preemptionCtx.tasRequests) > 0,
 	}
 	candidatesGenerator := classical.NewCandidateIterator(hierarchicalReclaimCtx, p.enabledAfs, preemptionCtx.frsNeedPreemption, preemptionCtx.snapshot, p.clock, preemptioncommon.CandidatesOrdering)
 	var attemptPossibleOpts []preemptionAttemptOpts
@@ -320,9 +321,16 @@ func (p *Preemptor) classicalPreemptions(preemptionCtx *preemptionCtx) []*Target
 				WorkloadCq:   preemptionCtx.snapshot.ClusterQueue(candidate.ClusterQueue),
 			})
 			if workloadFits(preemptionCtx, attemptOpts.borrowing) {
-				targets = fillBackWorkloads(preemptionCtx, targets, attemptOpts.borrowing)
-				restoreSnapshot(preemptionCtx.snapshot, targets)
-				return targets
+				kept := fillBackWorkloads(preemptionCtx, slices.Clone(targets), attemptOpts.borrowing)
+				if !reclaimedTargetsRespectNominal(preemptionCtx, kept) {
+					restoreSnapshot(preemptionCtx.snapshot, kept)
+					for _, t := range targets {
+						preemptionCtx.snapshot.RemoveWorkload(t.WorkloadInfo)
+					}
+					continue
+				}
+				restoreSnapshot(preemptionCtx.snapshot, kept)
+				return kept
 			}
 		}
 		restoreSnapshot(preemptionCtx.snapshot, targets)
@@ -349,6 +357,26 @@ func restoreSnapshot(snapshot *schdcache.Snapshot, targets []*Target) {
 	for _, t := range targets {
 		snapshot.AddWorkload(t.WorkloadInfo)
 	}
+}
+
+// reclaimedTargetsRespectNominal checks that for every cross-ClusterQueue
+// target in `targets` (currently removed from `preemptionCtx.snapshot`),
+// adding that single target back makes its ClusterQueue exceed nominal quota
+// on the contested resources — i.e., the final target set only reclaims
+// borrowed capacity and never dips into a peer queue's nominal quota.
+func reclaimedTargetsRespectNominal(preemptionCtx *preemptionCtx, targets []*Target) bool {
+	for _, t := range targets {
+		if t.WorkloadCq == nil || t.WorkloadCq.Name == preemptionCtx.preemptorCQ.Name {
+			continue
+		}
+		preemptionCtx.snapshot.AddWorkload(t.WorkloadInfo)
+		borrowing := !schdcache.IsWithinNominalInResources(t.WorkloadCq, preemptionCtx.frsNeedPreemption)
+		preemptionCtx.snapshot.RemoveWorkload(t.WorkloadInfo)
+		if !borrowing {
+			return false
+		}
+	}
+	return true
 }
 
 // parseStrategies converts an array of strategies into the functions to the used by the algorithm.

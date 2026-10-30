@@ -66,6 +66,7 @@ type HierarchicalPreemptionCtx struct {
 	FrsNeedPreemption sets.Set[resources.FlavorResource]
 	Requests          resources.FlavorResourceQuantities
 	WorkloadOrdering  workload.Ordering
+	HasTASRequests    bool
 }
 
 func IsBorrowingWithinCohortForbidden(cq *schdcache.ClusterQueueSnapshot) (bool, *int32) {
